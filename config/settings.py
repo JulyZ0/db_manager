@@ -33,10 +33,16 @@ if not SECRET_KEY:
         "缺少 DJANGO_SECRET_KEY。请复制 .env.example 为 .env 并填写密钥。"
     )
 
-DEBUG = env_bool("DJANGO_DEBUG", True)
+# 默认 False：未显式开启即按生产口径运行（不回显 traceback / SQL / 配置）。
+# 本地开发需要调试页时才在 .env 里写 DJANGO_DEBUG=True。
+DEBUG = env_bool("DJANGO_DEBUG", False)
 
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
-if DEBUG:
+
+# 测试进程需要 testserver；开发态放宽到任意本地绑定地址。
+# 生产（DEBUG=False 且非测试）只认显式配置的白名单，不做任何自动放宽。
+RUNNING_TESTS = "pytest" in sys.modules
+if DEBUG or RUNNING_TESTS:
     ALLOWED_HOSTS = [*ALLOWED_HOSTS, "0.0.0.0", "testserver"]
 
 
@@ -64,6 +70,9 @@ MIDDLEWARE = [
     # 自定义耗时中间件必须靠前，才能覆盖后续全部处理时间
     "common.middleware.RequestTimingMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # 静态文件由应用进程直接提供：生产下 DEBUG=False，runserver 不再服务
+    # /static/，没有这一层页面会丢样式与脚本（控制台直接不可用）
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -169,21 +178,87 @@ STATICFILES_DIRS = [BASE_DIR / "static"]
 STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {
-        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"
+        # 用 Compressed 而非 Manifest 版本：Manifest 在 collectstatic 未执行时
+        # 会直接抛异常（页面全挂），而本项目的静态文件是手工维护的少量资源，
+        # gzip 压缩收益已经足够。
+        "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage"
     },
 }
+
+# whitenoise 直接读 STATIC_ROOT 提供服务，因此启动时必须先 collectstatic
+WHITENOISE_ROOT = STATIC_ROOT
 
 
 # ---------------------------------------------------------------------------
 # 安全（生产环境通过环境变量收紧）
 # ---------------------------------------------------------------------------
 
+# 是否采信 X-Forwarded-For / X-Forwarded-Proto。默认关闭：
+# 这些请求头客户端可任意伪造，直接采信会让审计日志里的来源 IP 变成假证据。
+# 只有确实跑在反向代理（nginx / 公司网关）之后时才置 True。
+#
+# 必须定义在下面的安全块之前：SECURE_PROXY_SSL_HEADER 依赖它。
+TRUST_PROXY_HEADERS = env_bool("TRUST_PROXY_HEADERS", False)
+
 if not DEBUG:
     SECURE_CONTENT_TYPE_NOSNIFF = True
-    SECURE_BROWSER_XSS_FILTER = True
+    # SECURE_BROWSER_XSS_FILTER 在 Django 4.0 起已废弃、Django 6 中已移除
+    # （X-XSS-Protection 头部本身被主流浏览器弃用且可能引入漏洞），
+    # 这里改用 Referrer-Policy，它才是当前仍有效的防线。
+    SECURE_REFERRER_POLICY = "same-origin"
     SESSION_COOKIE_HTTPONLY = True
     CSRF_COOKIE_HTTPONLY = True
     X_FRAME_OPTIONS = "DENY"
+
+    # --- HTTPS 相关 ------------------------------------------------------
+    # 默认全部关闭，由 HTTPS_ENABLED 一次性开启。
+    #
+    # 为什么不默认打开 SECURE_SSL_REDIRECT：本系统面向内网运维，
+    # 默认部署是 http://内网IP:8000。若默认开启重定向，用户打开页面会被
+    # 跳到一个没有 TLS 监听的 https 地址，表现为"打不开"——服务其实
+    # 好好的，却像是彻底挂了。因此必须由部署者显式声明"我在 TLS 后面"。
+    HTTPS_ENABLED = env_bool("HTTPS_ENABLED", False)
+    # 反向代理卸载 TLS 时，Django 只能从 X-Forwarded-Proto 得知原始协议
+    SECURE_PROXY_SSL_HEADER = (
+        ("HTTP_X_FORWARDED_PROTO", "https") if TRUST_PROXY_HEADERS else None
+    )
+    SECURE_SSL_REDIRECT = HTTPS_ENABLED
+    SESSION_COOKIE_SECURE = HTTPS_ENABLED
+    CSRF_COOKIE_SECURE = HTTPS_ENABLED
+
+    # HSTS 一旦下发就会被浏览器记住，且**无法撤回**：设成 31536000 之后，
+    # 在有效期内即使撤掉配置，浏览器仍会强制走 https。所以默认 0（不下发），
+    # 确认长期只走 https 后再逐步调大（先 3600 试，再 31536000）。
+    SECURE_HSTS_SECONDS = (
+        max(0, env_int("SECURE_HSTS_SECONDS", 0)) if HTTPS_ENABLED else 0
+    )
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = (
+        env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", False) if HTTPS_ENABLED else False
+    )
+    # preload 会把域名提交进浏览器的内置列表，退出流程以月计，慎用
+    SECURE_HSTS_PRELOAD = (
+        env_bool("SECURE_HSTS_PRELOAD", False) if HTTPS_ENABLED else False
+    )
+else:
+    # 开发环境显式置空，避免误配的环境变量在调试时把请求 301 到 https
+    HTTPS_ENABLED = False
+    SECURE_PROXY_SSL_HEADER = None
+    SECURE_SSL_REDIRECT = False
+    SESSION_COOKIE_SECURE = False
+    CSRF_COOKIE_SECURE = False
+    SECURE_HSTS_SECONDS = 0
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = False
+    SECURE_HSTS_PRELOAD = False
+    SECURE_REFERRER_POLICY = "same-origin"
+
+# 域名白名单：HTTPS 下提交表单必须带 Origin/Referer，Django 会拿它与
+# CSRF_TRUSTED_ORIGINS 比对。走 https 且非默认端口时必须显式列出，
+# 否则所有 POST 都会 403 —— 这个错误在生产上非常常见。
+CSRF_TRUSTED_ORIGINS = [
+    item.strip()
+    for item in (env("CSRF_TRUSTED_ORIGINS", "") or "").split(",")
+    if item.strip()
+]
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +354,26 @@ PROBE_BACKOFF_BASE_MS = max(0, min(5000, env_int("PROBE_BACKOFF_BASE_MS", 200)))
 # 这个值就是 HTTP 请求的最坏耗时上限。
 PROBE_TOTAL_BUDGET_MS = max(1000, min(30000, env_int("PROBE_TOTAL_BUDGET_MS", 5000)))
 SLOW_REQUEST_MS = env_int("SLOW_REQUEST_MS", 500)
+
+# --- 慢请求日志的异步批量写入 -----------------------------------------------
+# 慢请求常发生在数据库本身繁忙时，此时再同步 INSERT 会形成正反馈，
+# 因此改为「请求线程投递 + 后台线程合批写库」。
+# SLOW_LOG_ASYNC=False 可退回同步写（排障用，或极端低配机器）。
+SLOW_LOG_ASYNC = env_bool("SLOW_LOG_ASYNC", True)
+# 队列上限。满了就丢弃并计数，绝不阻塞请求线程。
+SLOW_LOG_QUEUE_SIZE = max(1, env_int("SLOW_LOG_QUEUE_SIZE", 2000))
+# 攒够多少条就合并成一次 bulk_create
+SLOW_LOG_BATCH_SIZE = max(1, env_int("SLOW_LOG_BATCH_SIZE", 50))
+# 最长等待多久必须刷一次，保证慢请求记录不会长时间停在内存里
+SLOW_LOG_FLUSH_SECONDS = max(0.1, float(env_int("SLOW_LOG_FLUSH_SECONDS", 5)))
+
+# --- 列表页模糊搜索 ---------------------------------------------------------
+# contains（默认）：LIKE '%关键词%'，语义与界面提示一致；在 PostgreSQL 上
+#   由 pg_trgm 的 GIN 索引兜底（见 assets/migrations/0005）。
+# prefix：LIKE '关键词%'，能走普通 B-tree 索引，但只能匹配开头。
+# 实例上万且跑在 SQLite 上时，可改成 prefix 换取确定性性能。
+SEARCH_MODE = env("SEARCH_MODE", "contains")
+
 PASSWORD_LENGTH = env_int("PASSWORD_LENGTH", 32)
 
 # 批量轮换的并发度。

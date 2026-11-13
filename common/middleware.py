@@ -90,20 +90,25 @@ class RequestTimingMiddleware:
         user = getattr(request, "user", None)
         user_id = str(user.pk) if (user is not None and user.is_authenticated) else ""
 
+        # 只投递、不写库：慢请求往往意味着数据库本身正忙，此时同步 INSERT
+        # 会在最脆弱的时刻再加一次写事务，把"慢"变成"更慢"。
+        # submit() 永不阻塞、永不抛异常，队列满时丢弃计数。
         try:
-            from apps.metrics.models import SlowRequestLog
+            from apps.metrics import slowlog
 
-            SlowRequestLog.objects.create(
-                request_id=request_id,
-                method=request.method,
-                path=request.path[:255],
-                status_code=status_code,
-                duration_ms=duration_ms,
-                user_id=user_id,
-                remote_addr=request.META.get("REMOTE_ADDR") or None,
+            slowlog.submit(
+                {
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.path[:255],
+                    "status_code": status_code,
+                    "duration_ms": duration_ms,
+                    "user_id": user_id,
+                    "remote_addr": request.META.get("REMOTE_ADDR") or None,
+                }
             )
         except Exception:  # noqa: BLE001 - 监控写入失败绝不能影响业务响应
-            logger.exception("写入慢请求记录失败 request_id=%s", request_id)
+            logger.exception("投递慢请求记录失败 request_id=%s", request_id)
 
         logger.warning(
             "慢请求 %s %s -> %d 耗时 %dms（阈值 %dms）request_id=%s",

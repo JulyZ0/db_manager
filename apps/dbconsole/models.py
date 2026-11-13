@@ -17,6 +17,8 @@ class StatementAuditLog(models.Model):
       截断到 500 字符既能定位问题，又不至于把敏感字面量长期留存。
     - 只记语句类型与耗时，不记返回行内容。
     - `user_label` 存用户名快照，账号被删后审计依然可读。
+    - `instance_label` 存实例名称快照，配合 SET_NULL 让"删实例"这个动作
+      本身仍然留痕：实例没了，但"谁在哪个实例上执行过什么"还能读出来。
     """
 
     class Kind(models.TextChoices):
@@ -27,9 +29,15 @@ class StatementAuditLog(models.Model):
 
     instance = models.ForeignKey(
         "assets.Instance",
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="statement_logs",
         verbose_name="实例",
+    )
+    # 实例名称快照。删除实例后 FK 置空，没有这个字段审计就成了无主记录。
+    instance_label = models.CharField(
+        "实例名称快照", max_length=200, blank=True, default=""
     )
     user_label = models.CharField("操作人", max_length=64, blank=True, default="")
     engine = models.CharField("引擎", max_length=20)

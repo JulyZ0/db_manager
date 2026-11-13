@@ -36,6 +36,45 @@ class BootstrapMixin:
                 widget.attrs.setdefault("rows", 3)
 
 
+class TopologyAwareSelect(forms.Select):
+    """集群下拉：给每个 option 标注所属集群的架构。
+
+    前端据此实时过滤"角色"下拉，避免用户先选到非法角色再被后端拒绝。
+    真正的把关仍在 ``InstanceForm.clean()`` 与 ``Instance.clean()``，
+    这里只负责让界面不给出错误选项。
+    """
+
+    def create_option(
+        self, name, value, label, selected, index, subindex=None, attrs=None
+    ):
+        option = super().create_option(
+            name, value, label, selected, index, subindex, attrs
+        )
+        cluster = getattr(value, "instance", None)
+        if cluster is not None:
+            option["attrs"]["data-topology"] = cluster.topology
+        return option
+
+
+class ScopedRoleSelect(forms.Select):
+    """角色下拉：给每个 option 标注它适用于哪些架构（逗号分隔）。"""
+
+    def __init__(self, scopes=None, **kwargs):
+        self.scopes = scopes or {}
+        super().__init__(**kwargs)
+
+    def create_option(
+        self, name, value, label, selected, index, subindex=None, attrs=None
+    ):
+        option = super().create_option(
+            name, value, label, selected, index, subindex, attrs
+        )
+        key = getattr(value, "value", value)
+        if key in self.scopes:
+            option["attrs"]["data-allow"] = self.scopes[key]
+        return option
+
+
 class DepartmentForm(BootstrapMixin, forms.ModelForm):
     class Meta:
         model = Department
@@ -89,7 +128,7 @@ class ClusterForm(BootstrapMixin, forms.ModelForm):
             "name": "同一部门内不可重名，不同部门可以重名",
             "alias": "可选，全局唯一。控制台里可用「别名.实例别名」快速切换",
             "department": "集群必须归属一个部门",
-            "topology": "声明部署形态；实例之间谁跟谁同步，在实例上填「复制上游」",
+            "topology": "架构决定实例可选的角色；复制关系在集群详情页统一编排",
         }
         widgets = {
             "name": forms.TextInput(attrs={"placeholder": "例如：core-mysql-prod"}),
@@ -135,7 +174,6 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
             "host",
             "port",
             "role",
-            "replica_of",
             "username",
             "remark",
             "is_active",
@@ -147,7 +185,6 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
             "host": "主机地址",
             "port": "端口",
             "role": "角色",
-            "replica_of": "复制上游",
             "username": "登录账号",
             "remark": "备注",
             "is_active": "启用",
@@ -156,8 +193,7 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
             "alias": "可选，集群内唯一。控制台里可用「集群别名.本别名」切换",
             "host": "支持 IP 或域名，例如 10.0.12.31 / db-01.internal",
             "port": "1 - 65535",
-            "role": "主库/从库/代理；仅用于标注这台实例的定位",
-            "replica_of": "从库填它跟随的主库；双主场景两台互填；单机留空",
+            "role": "可选范围由集群架构决定；复制关系在集群详情页统一编排",
             "username": "用于连接数据库的账号名",
             "is_active": "只有启用的实例才会参与定时密码轮换",
         }
@@ -180,37 +216,55 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
         # 让下拉框显示"部门/集群"，避免同名集群选错
         self.fields["cluster"].label_from_instance = lambda c: f"{c.department.name} / {c.name}"
 
-        # 复制上游只允许选同集群的实例；这里先给出全量候选项，
-        # 真正"必须同集群"由 clean() 判定（切集群时下拉不会跟着变）
-        replica_field = self.fields["replica_of"]
-        replica_field.queryset = (
-            Instance.objects.select_related("cluster").order_by(
-                "cluster__name", "name"
-            )
+        # 角色可选范围由集群架构决定。这里给每个 option 打上 data-allow，
+        # 前端据选中集群实时过滤；后端 clean() 再兜一层，避免绕过前端提交。
+        cluster_field = self.fields["cluster"]
+        cluster_field.widget = TopologyAwareSelect(
+            choices=cluster_field.choices, attrs={"class": "select"}
         )
-        replica_field.empty_label = "无（单机 / 主库）"
-        replica_field.label_from_instance = lambda i: (
-            f"{i.cluster.name} / {i.name} ({i.host}:{i.port})"
+
+        role_field = self.fields["role"]
+        scopes = self._role_scopes()
+        role_field.choices = [(value, label) for value, label, _ in scopes]
+        role_field.widget = ScopedRoleSelect(
+            scopes={value: allow for value, _, allow in scopes},
+            choices=role_field.choices,
+            attrs={"class": "select"},
         )
-        if self.instance.pk:
-            # 不能把自己选成自己的上游
-            replica_field.queryset = replica_field.queryset.exclude(
-                id=self.instance.pk
-            )
+
+    @staticmethod
+    def _role_scopes() -> list[tuple[str, str, str]]:
+        """(角色值, 显示名, 适用架构列表) —— 供前端过滤与后端校验共用一份口径。"""
+        labels = dict(Instance.Role.choices)
+        scoped = []
+        for value in Instance.Role.values:
+            tops = [
+                topo
+                for topo in Cluster.Topology.values
+                if value in Instance.roles_for_topology(topo)
+            ]
+            scoped.append((value, labels[value], ",".join(tops)))
+        return scoped
 
     def clean(self):
         cleaned = super().clean()
         cluster = cleaned.get("cluster")
-        upstream = cleaned.get("replica_of")
+        role = cleaned.get("role")
 
-        if upstream is None:
-            return cleaned
-
-        if cluster and upstream.cluster_id != cluster.id:
-            self.add_error(
-                "replica_of",
-                "复制上游必须与本实例属于同一集群：跨集群的复制关系不在台账登记范围",
-            )
+        # 架构是集群级决策，实例只能在架构允许的范围内选角色。
+        # 放在表单层拦是为了给出可读提示；模型层 clean() 仍有同样判定，
+        # 覆盖管理后台等其它写入路径。
+        if cluster and role:
+            allowed = Instance.roles_for_topology(cluster.topology)
+            if role not in allowed:
+                labels = dict(Instance.Role.choices)
+                allowed_text = "、".join(labels[r] for r in allowed)
+                self.add_error(
+                    "role",
+                    f"集群「{cluster.name}」的架构是"
+                    f"「{cluster.get_topology_display()}」，"
+                    f"实例角色只能是：{allowed_text}",
+                )
         return cleaned
 
     def clean_port(self):

@@ -30,7 +30,13 @@ def dept(api_client):
 def cluster(api_client, dept):
     return api_client.post(
         "/api/v1/clusters",
-        data={"name": "core-mysql-prod", "department_id": dept["id"], "env": "prod"},
+        data={
+            "name": "core-mysql-prod",
+            "department_id": dept["id"],
+            "env": "prod",
+            # 用例里要建从库实例，架构必须是主从：架构决定可选角色
+            "topology": "master_slave",
+        },
         content_type="application/json",
     ).json()
 

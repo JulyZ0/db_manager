@@ -137,6 +137,12 @@
   var pendingConfirm = null; // 已提示需确认的破坏性语句
 
   function csrfToken() {
+    // 优先读 <meta name="csrf-token">：生产下 CSRF_COOKIE_HTTPONLY=True，
+    // cookie 对 JS 不可见，只有模板渲染出的 meta 才是可靠来源。
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    if (meta && meta.content) return meta.content;
+
+    // 回退到 cookie：仅开发态（HttpOnly 关闭）能走到这里
     var m = document.cookie.match(/(^|;\s*)csrftoken=([^;]+)/);
     return m ? decodeURIComponent(m[2]) : "";
   }
@@ -192,7 +198,7 @@
   var HELP = [
     "可用命令：",
     "  help                    显示本帮助",
-    "  list                    列出所有实例（含 id 与别名）",
+    "  list [页码]             列出实例（含 id 与别名），默认第 1 页",
     "  sw <目标>               切换要操作的实例，写法见下",
     "  status                  查看当前实例",
     "  verify                  连一次目标库，验证账号密码是否可用",
@@ -213,15 +219,26 @@
     writeText(HELP);
   }
 
-  function cmdList() {
-    return fetch("/console/instances.json", { headers: { "X-Requested-With": "XMLHttpRequest" } })
+  function cmdList(pageArg) {
+    // 实例多了以后一次拉全量会把控制台卡住，改成分页：list / list 2
+    var page = parseInt(pageArg, 10);
+    if (!isFinite(page) || page < 1) page = 1;
+
+    return fetch("/console/instances.json?page=" + page,
+                 { headers: { "X-Requested-With": "XMLHttpRequest" } })
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (!data.results.length) {
-          writeText("还没有登记任何实例。请先到「实例管理」新增。", "term-warn");
+          if (data.count) {
+            // 有数据但这一页是空的：多半是翻过了最后一页
+            writeText("第 " + page + " 页没有数据，共 " + data.count + " 个实例。用 list 1 回到第一页。", "term-warn");
+          } else {
+            writeText("还没有登记任何实例。请先到「实例管理」新增。", "term-warn");
+          }
           return;
         }
-        writeText("共 " + data.count + " 个实例：", "term-dim");
+        var pages = Math.max(1, Math.ceil(data.count / data.page_size));
+        writeText("共 " + data.count + " 个实例，第 " + data.page + "/" + pages + " 页：", "term-dim");
         renderTable(
           ["id", "名称", "别名", "引擎", "环境", "地址", "账号", "密码", "状态"],
           data.results.map(function (i) {
@@ -237,6 +254,9 @@
             ];
           })
         );
+        if (data.has_next) {
+          writeText("下一页：list " + (data.page + 1), "term-dim");
+        }
       })
       .catch(function () { writeText("获取实例列表失败", "term-err"); });
   }
@@ -397,7 +417,7 @@
 
     if (cmd === "help" || cmd === "?") return Promise.resolve(cmdHelp());
     if (cmd === "clear" || cmd === "cls") return Promise.resolve(cmdClear());
-    if (cmd === "list" || cmd === "ls") return cmdList();
+    if (cmd === "list" || cmd === "ls") return cmdList(parts[1]);
     if (cmd === "sw") return cmdSw(parts[1]);
     if (cmd === "status") return Promise.resolve(cmdStatus());
     if (cmd === "verify") return cmdVerify();

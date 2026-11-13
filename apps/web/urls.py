@@ -37,6 +37,17 @@ urlpatterns = [
         views.cluster_topology,
         name="cluster_topology",
     ),
+    # 复制关系编排（架构是集群级决策，编排入口也只放在集群侧）
+    path(
+        "clusters/<int:cluster_id>/replication/",
+        views.cluster_replication,
+        name="cluster_replication",
+    ),
+    path(
+        "clusters/<int:cluster_id>/replication/auto/",
+        views.cluster_replication_auto,
+        name="cluster_replication_auto",
+    ),
     path("clusters/<int:cluster_id>/edit/", views.cluster_edit, name="cluster_edit"),
     path(
         "clusters/<int:cluster_id>/delete/", views.cluster_delete, name="cluster_delete"

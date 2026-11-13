@@ -26,6 +26,8 @@ from apps.web.decorators import login_required_page
 from apps.web.forms import ClusterForm, DepartmentForm, InstanceForm
 from common import scheduler as scheduler_mod
 from common.pagination import DEFAULT_PAGE_SIZE, paginate_queryset
+from common.request import actor_label, client_ip
+from common.search import build_search_q
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +116,7 @@ def department_list(request: HttpRequest) -> HttpResponse:
 
     search = (request.GET.get("search") or "").strip()
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(code__icontains=search))
+        qs = qs.filter(build_search_q(search, ["name", "code"]))
 
     qs = qs.order_by("id")
     page_data = paginate_queryset(qs, _page(request), DEFAULT_PAGE_SIZE)
@@ -205,7 +207,7 @@ def cluster_list(request: HttpRequest) -> HttpResponse:
     env = request.GET.get("env") or ""
 
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(department__name__icontains=search))
+        qs = qs.filter(build_search_q(search, ["name", "department__name"]))
     if department_id.isdigit():
         qs = qs.filter(department_id=int(department_id))
     if env:
@@ -318,6 +320,81 @@ def cluster_topology(request: HttpRequest, cluster_id: int) -> JsonResponse:
 
 
 @login_required_page
+@require_http_methods(["GET", "POST"])
+def cluster_replication(request: HttpRequest, cluster_id: int) -> HttpResponse:
+    """集群级复制关系编排。
+
+    架构是集群级决策，所以「谁复制谁」也只在这里配置，
+    实例表单只负责选角色（且角色受架构限制）。
+    """
+    from apps.assets import replication
+
+    cluster = get_object_or_404(
+        Cluster.objects.select_related("department"), id=cluster_id
+    )
+    instances = list(cluster.instances.order_by("role", "name"))
+
+    if request.method == "POST":
+        plan = {}
+        for obj in instances:
+            raw = (request.POST.get(f"upstream_{obj.id}") or "").strip()
+            plan[obj.id] = int(raw) if raw.isdigit() else None
+
+        try:
+            changed = replication.save_manual(cluster, plan)
+        except ValueError as exc:
+            messages.error(request, f"未保存：{exc}")
+        else:
+            messages.success(
+                request,
+                f"复制关系已保存，共更新 {changed} 个实例"
+                if changed
+                else "复制关系没有变化",
+            )
+            return redirect("web:cluster_detail", cluster_id=cluster.id)
+    else:
+        plan = replication.current_plan(cluster)
+
+    # 模板不能给 dict 做变量下标，这里摊平成行数据
+    rows = [
+        {"instance": obj, "upstream_id": plan.get(obj.id)}
+        for obj in instances
+    ]
+
+    return render(
+        request,
+        "web/cluster_replication.html",
+        {
+            "active_nav": "clusters",
+            "cluster": cluster,
+            "instances": instances,
+            "rows": rows,
+        },
+    )
+
+
+@login_required_page
+@require_POST
+def cluster_replication_auto(request: HttpRequest, cluster_id: int) -> HttpResponse:
+    """按当前架构一键生成复制关系。"""
+    from apps.assets import replication
+
+    cluster = get_object_or_404(Cluster, id=cluster_id)
+    plan, notes = replication.suggest_upstreams(cluster)
+
+    for note in notes:
+        messages.info(request, note)
+
+    changed = replication.apply_plan(cluster, plan)
+    if changed:
+        messages.success(request, f"已按「{cluster.get_topology_display()}」架构更新 {changed} 个实例")
+    else:
+        messages.warning(request, "没有需要调整的复制关系")
+
+    return redirect("web:cluster_detail", cluster_id=cluster.id)
+
+
+@login_required_page
 @require_POST
 def cluster_delete(request: HttpRequest, cluster_id: int) -> HttpResponse:
     cluster = get_object_or_404(Cluster, id=cluster_id)
@@ -348,7 +425,7 @@ def instance_list(request: HttpRequest) -> HttpResponse:
     role = request.GET.get("role") or ""
 
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(host__icontains=search))
+        qs = qs.filter(build_search_q(search, ["name", "host"]))
     if cluster_id.isdigit():
         qs = qs.filter(cluster_id=int(cluster_id))
     if department_id.isdigit():
@@ -406,7 +483,9 @@ def instance_detail(request: HttpRequest, instance_id: int) -> HttpResponse:
         "rotation_count": PasswordRotationLog.objects.filter(instance=instance).count(),
         "rotation_policy": policy,
         "rotation_schedule_text": credential_schedule.describe_schedule(policy),
-        "in_rotation_scope": instance.id in set(policy.resolve_instance_ids()),
+        # 只问"这一个实例在不在范围内"：判断下推到数据库，避免每次打开
+        # 详情页都把全部启用实例 id 拉成列表。
+        "in_rotation_scope": policy.includes_instance(instance.id),
     }
     return render(request, "web/instance_detail.html", context)
 
@@ -420,10 +499,14 @@ def instance_verify_credentials(request: HttpRequest, instance_id: int) -> JsonR
     "端口通不通"回答不了"密码对不对"——运维真正关心的往往后者，
     所以详情页一打开就自动验一次，不需要额外点按钮。
 
-    为什么不落库
-    ------------
-    验证结果是瞬时状态，5 秒后重验可能就是另一个结论。把它固化进 Instance
-    字段会让"上次验证通过"变成误导性的陈旧数据，因此只回显、不存储。
+    为什么记审计却仍不落业务字段
+    ----------------------------
+    验证结果（ok/error）是瞬时状态，5 秒后重验可能就是另一个结论，固化进
+    Instance 字段会变成误导性的陈旧数据。但这个端点会**用真实凭据去连目标
+    库**，属于有副作用的主动连接：匿名者可以拿它刷连接数、也可以借返回的
+    错误码 + 响应耗时做内网端口探测。因此每次调用都记一条审计日志
+    （操作人、来源 IP、目标实例、结论），出了问题能追溯，同时保留免登录
+    的便利。
 
     响应永远是 200：连不上是有效业务结论，不是服务端错误。
     """
@@ -434,6 +517,16 @@ def instance_verify_credentials(request: HttpRequest, instance_id: int) -> JsonR
     from apps.dbconsole.services import verify_credentials
 
     result = verify_credentials(instance)
+
+    logger.info(
+        "凭据验证 instance=%s actor=%s ip=%s ok=%s error=%s latency=%sms",
+        instance.id,
+        actor_label(request),
+        client_ip(request),
+        result.ok,
+        result.error or "-",
+        result.latency_ms if result.latency_ms is not None else "-",
+    )
 
     return JsonResponse(
         {
@@ -799,7 +892,7 @@ def console_exec(request: HttpRequest, instance_id: int) -> JsonResponse:
             }
         )
 
-    if is_destructive(sql) and request.POST.get("confirm") != "1":
+    if is_destructive(sql, engine_of(instance)) and request.POST.get("confirm") != "1":
         return JsonResponse(
             {
                 "ok": False,
@@ -814,7 +907,7 @@ def console_exec(request: HttpRequest, instance_id: int) -> JsonResponse:
     return JsonResponse(
         {
             "ok": result.ok,
-            "kind": classify_statement(sql),
+            "kind": classify_statement(sql, engine_of(instance)),
             "columns": result.columns,
             "rows": result.rows,
             "row_count": result.row_count,
@@ -832,16 +925,53 @@ def console_instances(request: HttpRequest) -> JsonResponse:
 
     复用 ``resolver.instance_summary``，保证 ``list`` 与 ``sw`` 的字段口径一致
     （尤其是 ``alias`` / ``cluster_alias``，用户要照着它拼 ``sw`` 的目标）。
+
+    分页
+    ----
+    此前一次性返回全部实例摘要，实例上千时单个响应体可达数 MB：控制台
+    要先把整个 JSON 解析完才能画出第一行，浏览器会明显卡住，服务端也要
+    一次性把上千个对象实例化。
+
+    改为与其它列表接口同一套口径（``{count, page, page_size, results}``），
+    默认 20 条，上限 100。控制台用 ``list`` / ``list 2`` 翻页。
     """
     from apps.assets import resolver
+    from common.pagination import paginate_queryset
 
-    rows = [
-        resolver.instance_summary(item)
-        for item in Instance.objects.select_related(
-            "cluster", "cluster__department"
-        ).order_by("cluster__department__name", "cluster__name", "name")
-    ]
-    return JsonResponse({"count": len(rows), "results": rows})
+    queryset = Instance.objects.select_related(
+        "cluster", "cluster__department"
+    ).order_by("cluster__department__name", "cluster__name", "name")
+
+    page_data = paginate_queryset(
+        queryset,
+        page=_int_param(request, "page", 1),
+        page_size=_int_param(request, "page_size", 20),
+    )
+    # 先切片再序列化：paginate_queryset 已经只取当前页的对象
+    rows = [resolver.instance_summary(item) for item in page_data["results"]]
+
+    return JsonResponse(
+        {
+            "count": page_data["count"],
+            "page": page_data["page"],
+            "page_size": page_data["page_size"],
+            "has_next": page_data["page"] * page_data["page_size"] < page_data["count"],
+            "results": rows,
+        }
+    )
+
+
+def _int_param(request: HttpRequest, name: str, default: int) -> int:
+    """从 query 里取整数参数，非法值退回默认值。
+
+    控制台的输入框是自由文本，``list abc`` 这种手误会走到这里；
+    直接 int() 会抛 ValueError 变成 500，对运维来说等于"设备坏了"。
+    """
+    raw = (request.GET.get(name) or "").strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 def console_switch(request: HttpRequest) -> JsonResponse:
@@ -880,13 +1010,28 @@ def console_switch(request: HttpRequest) -> JsonResponse:
 
 
 def console_verify(request: HttpRequest, instance_id: int) -> JsonResponse:
-    """控制台 ``verify`` 命令：连一次目标库确认凭据可用。"""
+    """控制台 ``verify`` 命令：连一次目标库确认凭据可用。
+
+    与详情页的异步验证一样免登录，但同样会用真实凭据发起主动连接，
+    因此每次调用都记一条带操作人与来源 IP 的日志，便于追溯被刷的情形。
+    """
     from apps.dbconsole.services import verify_credentials
 
     instance = get_object_or_404(
         Instance.objects.select_related("cluster"), id=instance_id
     )
     result = verify_credentials(instance)
+
+    logger.info(
+        "控制台凭据验证 instance=%s actor=%s ip=%s ok=%s error=%s latency=%sms",
+        instance.id,
+        actor_label(request),
+        client_ip(request),
+        result.ok,
+        result.error or "-",
+        result.latency_ms if result.latency_ms is not None else "-",
+    )
+
     return JsonResponse(
         {
             "ok": result.ok,

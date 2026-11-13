@@ -26,6 +26,12 @@
   };
 
   function csrfToken() {
+    // 优先读 <meta name="csrf-token">：生产下 CSRF_COOKIE_HTTPONLY=True，
+    // cookie 对 JS 不可见，只有模板渲染出的 meta 才是可靠来源。
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    if (meta && meta.content) return meta.content;
+
+    // 回退到 cookie：仅开发态（HttpOnly 关闭）能走到这里
     var m = document.cookie.match(/(^|;\s*)csrftoken=([^;]+)/);
     return m ? decodeURIComponent(m[2]) : "";
   }

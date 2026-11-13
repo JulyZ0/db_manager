@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import socket
+import sys
+import types
 
 import pytest
 
@@ -211,6 +213,10 @@ def test_driver_missing_is_classified(make_instance, monkeypatch):
         ("TRUNCATE TABLE t", "ddl"),
         ("-- 注释\nSELECT 1", "query"),
         ("/* 注释 */ SELECT 1", "query"),
+        # 可执行注释：服务端真的会执行里面的内容，必须按实际语句分类
+        ("/*!50000 DROP TABLE t*/", "ddl"),
+        ("/*!50000 SELECT 1*/", "query"),
+        ("# 注释\nDROP TABLE t", "ddl"),
         ("", "other"),
     ],
 )
@@ -224,13 +230,98 @@ def test_classify_statement(sql, expected):
         ("DROP TABLE t", True),
         ("drop database x", True),
         ("TRUNCATE t", True),
-        ("DELETE FROM t", False),
         ("SELECT 1", False),
         ("-- note\nDROP TABLE t", True),
+        # MySQL 可执行注释绕过：这是实测能打穿二次确认的写法
+        ("/*!50000 DROP TABLE t*/", True),
+        ("/*!50000 ; DROP TABLE t */", True),
+        ("/*! DROP TABLE t */", True),
+        ("/*!40000 TRUNCATE t */", True),
+        # 普通块注释里的内容服务端不执行，不能被判成破坏性
+        ("/* DROP TABLE t */ SELECT 1", False),
+        # 字符串字面量里的内容同样不算语句
+        ("SELECT '/*!50000 DROP TABLE t*/'", False),
+        # ---- 无条件 DELETE / UPDATE：一行清空整表，必须二次确认 ----
+        ("DELETE FROM t", True),
+        ("delete from t", True),
+        ("DELETE t", True),
+        ("UPDATE t SET a=1", True),
+        ("UPDATE t SET a = (SELECT max(x) FROM y) WHERE id = 1", False),
+        # 带条件的删除/更新不打扰用户
+        ("DELETE FROM t WHERE id = 1", False),
+        ("DELETE FROM t WHERE id IN (1, 2)", False),
+        ("UPDATE t SET a=1 WHERE id=2", False),
+        # WHERE 在顶层（哪怕条件里还嵌着子查询）就是有条件删除
+        ("DELETE FROM t WHERE id IN (SELECT id FROM x WHERE n = 1)", False),
+        # 引号里的 where 是字面量，不构成条件
+        ("UPDATE t SET note = 'where'", True),
     ],
 )
 def test_is_destructive(sql, destructive):
     assert services.is_destructive(sql) is destructive
+
+
+# Redis 没有 SQL，但一条命令就能清库、停实例、改口令。
+# 这些命令必须和 DROP TABLE 一样走二次确认，否则控制台就是个"一键炸库"入口。
+@pytest.mark.parametrize(
+    "command",
+    [
+        "FLUSHALL",
+        "flushall",
+        "FLUSHDB",
+        "SHUTDOWN",
+        "SHUTDOWN NOSAVE",
+        "CONFIG SET requirepass newpass",
+        "config rewrite",
+        "SCRIPT FLUSH",
+        "CLUSTER RESET",
+        "CLIENT KILL 127.0.0.1:6379",
+        "REPLICAOF NO ONE",
+        "DEBUG SLEEP 0",
+        "SWAPDB 0 1",
+        "KEYS *",
+    ],
+)
+def test_redis_destructive_commands_are_flagged(command):
+    assert services.is_destructive(command, "redis") is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "GET foo",
+        "SET foo bar",
+        "HSET user:1 name tom",
+        "DEL foo",
+        "TTL foo",
+        # 中性命令的非危险子命令不能被误伤
+        "CONFIG GET maxmemory",
+        "CLIENT LIST",
+        "INFO keyspace",
+    ],
+)
+def test_redis_safe_commands_are_not_flagged(command):
+    assert services.is_destructive(command, "redis") is False
+
+
+def test_redis_engine_does_not_flip_sql_verdict():
+    """DROP 在 Redis 上不是命令，不应被当成破坏性；反之亦然。"""
+    assert services.is_destructive("DROP TABLE t", "redis") is False
+    assert services.is_destructive("FLUSHALL") is False  # 未指定 engine 时按 SQL 判定
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("GET foo", "query"),
+        ("info", "query"),
+        ("SET foo bar", "write"),
+        ("DEL foo", "write"),
+        ("FLUSHALL", "other"),
+    ],
+)
+def test_redis_classify(command, expected):
+    assert services.classify_statement(command, "redis") == expected
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +385,79 @@ def test_execute_blocks_multi_statement_before_connecting(make_instance, monkeyp
     assert StatementAuditLog.objects.filter(instance=instance).count() == 1
 
 
+# ---------------------------------------------------------------------------
+# 控制台改密拦截
+# ---------------------------------------------------------------------------
+#
+# 台账是目标库口令的唯一真相来源。控制台里直接改口令会让目标库与本地
+# 密文错位，之后凭据验证、自动轮换全部 auth_failed，且运维看不出原因。
+
+
+@pytest.mark.parametrize(
+    "sql,engine",
+    [
+        ("ALTER USER 'app'@'%' IDENTIFIED BY 'newpass'", "mysql"),
+        ("alter user app identified with mysql_native_password by 'x'", "mysql"),
+        ("SET PASSWORD FOR 'app'@'%' = 'x'", "mysql"),
+        ("GRANT ALL ON *.* TO 'app'@'%' IDENTIFIED BY 'x'", "mysql"),
+        ("ALTER USER app WITH PASSWORD 'x'", "postgresql"),
+        ("ALTER ROLE app PASSWORD 'x'", "postgresql"),
+        # 可执行注释里的改密同样要识别，否则又是一条绕过路径
+        ("/*!50000 ALTER USER 'app'@'%' IDENTIFIED BY 'x'*/", "mysql"),
+        ("CONFIG SET requirepass newpass", "redis"),
+        ("ACL SETUSER app >newpass", "redis"),
+    ],
+)
+def test_changes_credentials_detected(sql, engine):
+    assert services.changes_credentials(sql, engine) is True
+
+
+@pytest.mark.parametrize(
+    "sql,engine",
+    [
+        ("SELECT user, host FROM mysql.user", "mysql"),
+        ("CREATE USER app2", "mysql"),
+        ("ALTER USER app ACCOUNT LOCK", "mysql"),
+        ("SELECT 1", "postgresql"),
+        ("GET foo", "redis"),
+        ("CONFIG GET requirepass", "redis"),
+    ],
+)
+def test_changes_credentials_not_false_positive(sql, engine):
+    assert services.changes_credentials(sql, engine) is False
+
+
+def test_execute_blocks_credential_change_before_connecting(make_instance, monkeypatch):
+    from apps.dbconsole.models import StatementAuditLog
+
+    def should_not_run(instance, password, sql, timeout):
+        raise AssertionError("改密语句不应发起连接")
+
+    monkeypatch.setitem(services._EXECUTORS, "mysql", should_not_run)
+    instance = make_instance()
+
+    result = services.execute_statement(
+        instance, "ALTER USER 'app'@'%' IDENTIFIED BY 'newpass'"
+    )
+
+    assert result.ok is False
+    assert result.error == services.ERROR_CREDENTIAL_CHANGE
+    # 提示要指向正确入口，否则运维只会反复重试
+    assert "轮换" in result.hint
+    assert StatementAuditLog.objects.filter(instance=instance).count() == 1
+
+
+def test_credential_change_blocked_keeps_local_ciphertext(make_instance):
+    """拦截后本地密文与版本号必须原样不动。"""
+    instance = make_instance()
+    before = (instance.password_ciphertext, instance.password_version)
+
+    services.execute_statement(instance, "SET PASSWORD FOR 'app'@'%' = 'x'")
+
+    instance.refresh_from_db()
+    assert (instance.password_ciphertext, instance.password_version) == before
+
+
 def test_execute_writes_audit_on_success(make_instance, monkeypatch):
     from apps.dbconsole.models import StatementAuditLog
 
@@ -316,6 +480,30 @@ def test_execute_writes_audit_on_success(make_instance, monkeypatch):
     assert log.ok is True
     assert log.row_count == 2
     assert log.duration_ms == 7
+    # 名称快照要在，删实例后这行是唯一定位线索
+    assert instance.name in log.instance_label
+    assert instance.host in log.instance_label
+
+
+def test_audit_survives_instance_deletion(make_instance, monkeypatch):
+    """删实例恰恰是最该留痕的操作，审计不能被连带删掉。"""
+    from apps.dbconsole.models import StatementAuditLog
+
+    def fake_exec(instance, password, sql, timeout):
+        return services.QueryResult(ok=True, columns=["a"], rows=[["1"]], row_count=1)
+
+    monkeypatch.setitem(services._EXECUTORS, "mysql", fake_exec)
+    instance = make_instance()
+    label = f"{instance.name} ({instance.host}:{instance.port})"
+
+    services.execute_statement(instance, "SELECT 1", user_label="admin")
+    instance.delete()
+
+    log = StatementAuditLog.objects.get()
+    assert log.instance is None
+    assert log.instance_label == label
+    assert log.user_label == "admin"
+    assert log.kind == "query"
 
 
 def test_execute_writes_audit_on_failure(make_instance, monkeypatch):
@@ -536,3 +724,73 @@ def test_api_execute_404_for_missing_instance(api_client):
         content_type="application/json",
     )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL 读超时
+# ---------------------------------------------------------------------------
+#
+# psycopg 的 connect_timeout 只覆盖建连阶段。建连成功之后，一条慢查询会
+# 一直挂到它自己结束，DB_QUERY_TIMEOUT_SECONDS 就形同虚设。只能用服务端
+# 参数 statement_timeout 让 PG 自己掐断。
+
+
+def _install_fake_psycopg(monkeypatch, captured: dict) -> None:
+    """注入假 psycopg，只为捕获 connect() 收到的参数。"""
+
+    class FakeCursor:
+        description = [types.SimpleNamespace(name="id")]
+        rowcount = -1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def execute(self, sql):
+            captured["sql"] = sql
+
+        def fetchmany(self, size):
+            return [(1,)]
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            captured["closed"] = True
+
+    fake = types.ModuleType("psycopg")
+
+    def connect(**kwargs):
+        captured["connect"] = kwargs
+        return FakeConn()
+
+    fake.connect = connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake)
+
+
+def test_postgres_sets_statement_timeout(make_instance, monkeypatch):
+    captured: dict = {}
+    _install_fake_psycopg(monkeypatch, captured)
+
+    instance = make_instance(engine="postgresql")
+    result = services.execute_statement(instance, "SELECT 1", timeout=30)
+
+    assert result.ok is True
+    kwargs = captured["connect"]
+    # 单位是毫秒，且与 connect_timeout 同源，避免两套上限互相矛盾
+    assert kwargs["options"] == "-c statement_timeout=30000"
+    assert kwargs["connect_timeout"] == 30
+    assert captured["closed"] is True
+
+
+def test_postgres_statement_timeout_scales_with_timeout(make_instance, monkeypatch):
+    captured: dict = {}
+    _install_fake_psycopg(monkeypatch, captured)
+
+    instance = make_instance(engine="postgresql")
+    services.execute_statement(instance, "SELECT 1", timeout=5)
+
+    assert captured["connect"]["options"] == "-c statement_timeout=5000"

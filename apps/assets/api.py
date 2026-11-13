@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Count, Q
+from django.db.models import Count
 from django.http import HttpRequest
 from django.utils import timezone
 from ninja import Query, Router, Status
@@ -39,6 +39,7 @@ from apps.assets.schemas import (
 from common.auth import django_session_auth
 from common.exceptions import ConflictError, NotFoundError
 from common.pagination import paginate_queryset
+from common.search import build_search_q
 
 departments_router = Router(tags=["部门"])
 clusters_router = Router(tags=["集群"])
@@ -215,6 +216,29 @@ def _resolve_replica_upstream(
     return upstream
 
 
+def _assert_role_allowed(cluster: Cluster, role: str) -> None:
+    """角色必须是集群架构允许的角色。
+
+    架构是集群级决策，实例只能在架构范围内选自己的定位。
+    这里提前拦是为了返回统一错误体；``Instance.clean()`` 仍有同样判定，
+    覆盖管理后台等其它写入路径。
+    """
+    allowed = Instance.roles_for_topology(cluster.topology)
+    if role in allowed:
+        return
+
+    labels = dict(Instance.Role.choices)
+    raise ConflictError(
+        f"集群架构是「{cluster.get_topology_display()}」，"
+        f"实例角色只能是：{'、'.join(labels[r] for r in allowed)}",
+        detail={
+            "field": "role",
+            "topology": cluster.topology,
+            "allowed_roles": list(allowed),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -229,7 +253,7 @@ def list_departments(
     qs = Department.objects.annotate(cluster_count=Count("clusters"))
 
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(code__icontains=search))
+        qs = qs.filter(build_search_q(search, ["name", "code"]))
     if is_active is not None:
         qs = qs.filter(is_active=is_active)
 
@@ -343,7 +367,7 @@ def list_clusters(
     if engine:
         qs = qs.filter(engine=engine)
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(department__name__icontains=search))
+        qs = qs.filter(build_search_q(search, ["name", "department__name"]))
 
     qs = qs.order_by("id")
     page_data = paginate_queryset(qs, page, page_size)
@@ -489,7 +513,7 @@ def list_instances(
     if role:
         qs = qs.filter(role=role)
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(host__icontains=search))
+        qs = qs.filter(build_search_q(search, ["name", "host"]))
 
     qs = qs.order_by("id")
     page_data = paginate_queryset(qs, page, page_size)
@@ -521,6 +545,8 @@ def create_instance(request: HttpRequest, payload: InstanceIn):
 
     alias = _clean_alias(payload.alias)
     _assert_instance_alias_free(payload.cluster_id, alias)
+
+    _assert_role_allowed(cluster, payload.role)
 
     upstream = _resolve_replica_upstream(
         payload.replica_of_id, cluster_id=payload.cluster_id
@@ -596,6 +622,11 @@ def update_instance(request: HttpRequest, instance_id: int, payload: InstancePat
         )
 
     data.pop("cluster_id", None)
+
+    # 角色与架构的一致性：集群可能被一起改掉，所以要按"最终集群 + 最终角色"判定
+    target_role = data.get("role", obj.role)
+    if target_role:
+        _assert_role_allowed(obj.cluster, target_role)
 
     # replica_of_id 用 exclude_unset 判断：显式传 null 表示解除复制关系，
     # 所以不能靠真值判断（None 也是有意义的指令）。

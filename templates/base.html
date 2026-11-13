@@ -3,6 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {# 生产下 CSRF_COOKIE_HTTPONLY=True，JS 读不到 csrftoken cookie；
+     统一从 meta 取，模板渲染的 token 与 cookie 同源，两条路径都可用 #}
+  <meta name="csrf-token" content="{{ csrf_token }}">
   <title>{% block title %}数据库实例管理系统{% endblock %}</title>
   <link rel="stylesheet" href="{% static 'css/app.css' %}">
 </head>

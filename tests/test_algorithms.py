@@ -555,6 +555,39 @@ class TestRotateAllScope:
         assert len(decrypt_secret(a.password_ciphertext)) == 16
 
 
+class TestRotateChunkPrefetch:
+    """一批实例只查一次，不能在循环里逐个 ``filter(pk=...)``。
+
+    这条用查询计数钉死：功能测试跑得再绿也看不出 N+1，而 N+1 恰恰是
+    "本地几十个实例没感觉、生产上百个实例就明显变慢"的那类问题。
+    """
+
+    def test_batch_lookup_is_single_query(
+        self, cluster, monkeypatch, django_assert_num_queries
+    ):
+        from apps.credentials import services
+
+        ids = [make_instance(cluster, name=f"p{i}", host=f"10.9.8.{i}").id for i in range(5)]
+        # 真正改密要连目标库，这里只验证取数方式，把它换成空实现
+        monkeypatch.setattr(services, "rotate_one", lambda instance, **kw: None)
+
+        with django_assert_num_queries(1):
+            ok, bad = services._rotate_chunk(ids, source="system")
+
+        assert (ok, bad) == (5, 0)
+
+    def test_missing_instance_is_skipped(self, cluster, monkeypatch):
+        """批次取数与处理之间实例被删，跳过而不是整批失败。"""
+        from apps.credentials import services
+
+        a = make_instance(cluster, name="keep", host="10.9.9.1")
+        monkeypatch.setattr(services, "rotate_one", lambda instance, **kw: None)
+
+        ok, bad = services._rotate_chunk([a.id, 999999], source="system")
+
+        assert (ok, bad) == (1, 0)
+
+
 # ---------------------------------------------------------------------------
 # metrics/services.py — aggregate_for_date
 # ---------------------------------------------------------------------------
@@ -696,3 +729,51 @@ class TestAggregate:
         aggregate_for_date(today)
         aggregate_for_date(today - timedelta(days=1))
         assert DailyInstanceStat.objects.count() == 2
+
+    def test_reaggregation_updates_existing_row(self, cluster):
+        """改成批量 upsert 后，重复统计必须**更新**旧行而不是留着旧值。
+
+        只看"行数没变"是不够的：批量写如果退化成 insert-only 或只更新
+        部分列，行数依然正确，但数量会永远停在第一次统计时的值。
+        """
+        from apps.metrics.models import DailyInstanceStat
+        from apps.metrics.services import aggregate_for_date
+
+        day = date(2026, 11, 13)
+        make_instance(cluster, name="a", host="10.8.0.1")
+        aggregate_for_date(day)
+
+        row = DailyInstanceStat.objects.get(stat_date=day)
+        assert row.instance_count == 1
+        first_created_at = row.created_at
+
+        make_instance(cluster, name="b", host="10.8.0.2")
+        make_instance(cluster, name="c", host="10.8.0.3")
+        aggregate_for_date(day)
+
+        assert DailyInstanceStat.objects.filter(stat_date=day).count() == 1
+        row.refresh_from_db()
+        assert row.instance_count == 3, "重复统计必须把已有行更新到最新数量"
+        # created_at 保持不变、updated_at 前进：这是 upsert 而非"删了重建"
+        assert row.created_at == first_created_at
+        assert row.updated_at >= first_created_at
+
+    def test_reaggregation_refreshes_name_snapshot(self, cluster):
+        """改名后重新统计同一天，快照列也应跟着更新（快照是"当天口径"）。"""
+        from apps.metrics.models import DailyInstanceStat
+        from apps.metrics.services import aggregate_for_date
+
+        day = date(2026, 11, 13)
+        make_instance(cluster, name="a", host="10.8.1.1")
+        aggregate_for_date(day)
+        assert DailyInstanceStat.objects.get(stat_date=day).cluster_name == (
+            "core-mysql-prod"
+        )
+
+        cluster.name = "renamed-cluster"
+        cluster.save(update_fields=["name"])
+        aggregate_for_date(day)
+
+        assert DailyInstanceStat.objects.get(stat_date=day).cluster_name == (
+            "renamed-cluster"
+        )

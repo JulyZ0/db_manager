@@ -184,6 +184,10 @@ REQUIRED_PACKAGES = [
     ("ninja", "django-ninja"),
     ("celery", "celery"),
     ("cryptography", "cryptography"),
+    # DEBUG=False 时靠它提供 /static/，缺了页面会没样式没脚本
+    ("whitenoise", "whitenoise"),
+    # 生产 WSGI 服务器；纯 Python，Windows 上无需编译
+    ("waitress", "waitress"),
 ]
 
 
@@ -365,6 +369,40 @@ def run_migrate() -> int:
     return 0
 
 
+def run_collectstatic() -> int:
+    """把 static/ 收集到 staticfiles/，供 whitenoise 直接对外提供。
+
+    DEBUG=False 时 runserver 不再服务 /static/，页面样式与脚本全靠这一步。
+    重复执行是安全的（覆盖写入），但为避免残留旧文件先清空目标目录。
+    """
+    info("正在收集静态文件（页面样式与脚本）...")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "manage.py",
+            "collectstatic",
+            "--noinput",
+            "--clear",
+            "-v",
+            "0",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        print(result.stdout[-2000:], flush=True)
+        print(result.stderr[-2000:], flush=True)
+        return fail(
+            "静态文件收集失败。",
+            "可手动执行 python manage.py collectstatic --noinput 查看详细错误。",
+        )
+    info("静态文件已就绪")
+    return 0
+
+
 def ensure_admin_account() -> int:
     """确保后台管理员账号存在。重复执行安全，不会覆盖已修改的密码。"""
     result = subprocess.run(
@@ -430,12 +468,20 @@ def wait_until_ready(port: int, timeout: float = 45.0) -> bool:
 
 def serve(port: int, open_browser: bool) -> int:
     url = f"http://127.0.0.1:{port}/"
+    # 用 waitress 而不是 runserver：
+    # - runserver 只有 DEBUG=True 时才服务 /static/，生产下页面会丢样式与脚本；
+    # - runserver 是开发服务器，单进程单线程、无并发保护。
+    # waitress 是纯 Python 的多线程 WSGI 服务器，Windows 上零编译依赖。
     cmd = [
         sys.executable,
-        "manage.py",
-        "runserver",
-        f"127.0.0.1:{port}",
-        "--noreload",
+        "-m",
+        "waitress",
+        f"--listen=127.0.0.1:{port}",
+        # 控制台执行语句可能连目标库数秒，线程数留足避免互相阻塞
+        "--threads=8",
+        # 探测/轮换页面的单次请求上限略高于后端 5 秒预算
+        "--channel-timeout=120",
+        "config.wsgi:application",
     ]
 
     print("\n" + "=" * 58, flush=True)
@@ -565,7 +611,7 @@ def main() -> int:
     if args.check:
         return self_check()
 
-    total = 6
+    total = 7
     step(1, total, "检查 Python 版本")
     if (code := check_python()) != 0:
         return code
@@ -586,7 +632,11 @@ def main() -> int:
         return code
     ensure_admin_account()
 
-    step(6, total, "启动服务")
+    step(6, total, "收集静态文件")
+    if (code := run_collectstatic()) != 0:
+        return code
+
+    step(7, total, "启动服务")
     port = pick_port(args.port)
     if port != args.port:
         info(f"端口 {args.port} 被占用，改用 {port}")

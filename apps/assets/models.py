@@ -104,7 +104,10 @@ class Cluster(TimeStampedModel):
         max_length=20,
         choices=Topology.choices,
         default=Topology.STANDALONE,
-        help_text="声明部署形态；具体复制方向由实例的「复制上游」决定",
+        help_text=(
+            "声明部署形态。架构是集群级决策：它决定实例可以担任哪些角色，"
+            "复制关系在集群详情页统一编排"
+        ),
     )
     description = models.TextField("描述", blank=True, default="")
     is_active = models.BooleanField("是否启用", default=True)
@@ -139,6 +142,21 @@ class Instance(TimeStampedModel):
         MASTER = "master", "主库"
         SLAVE = "slave", "从库"
         PROXY = "proxy", "代理"
+
+    # 架构决定实例可以担任什么角色。
+    # 架构是集群级决策，实例只在这个范围内选自己的定位，不能反过来改变架构。
+    # 主从/分片里从库才有意义；双主是两台主库互指，出现"从库"就说明架构填错了。
+    ROLES_BY_TOPOLOGY = {
+        Cluster.Topology.STANDALONE: (Role.MASTER, Role.PROXY),
+        Cluster.Topology.MASTER_SLAVE: (Role.MASTER, Role.SLAVE, Role.PROXY),
+        Cluster.Topology.DUAL_MASTER: (Role.MASTER, Role.PROXY),
+        Cluster.Topology.SHARDED: (Role.MASTER, Role.SLAVE, Role.PROXY),
+    }
+
+    @classmethod
+    def roles_for_topology(cls, topology: str) -> tuple[str, ...]:
+        """某种架构下允许的角色。未知架构放行全部，避免历史数据卡住。"""
+        return cls.ROLES_BY_TOPOLOGY.get(topology, tuple(cls.Role.values))
 
     class Status(models.TextChoices):
         UNKNOWN = "unknown", "未知"
@@ -211,27 +229,37 @@ class Instance(TimeStampedModel):
         super().save(*args, **kwargs)
 
     def clean(self):
-        """复制关系必须指向同集群的另一个实例。
+        """校验角色与复制关系是否自洽。
 
-        放在模型层而不是表单层，是因为 API 与页面两条写入路径都要生效；
-        Django 会在 full_clean() 时调用，保存时各自触发。
+        两条规矩都在模型层：API 与页面两条写入路径都要生效，
+        Django 会在 full_clean() 时调用。
+
+        1. 角色必须是集群架构允许的角色——架构是集群级决策，
+           实例只能在架构范围内选自己的定位，不能反过来改变架构。
+        2. 复制关系必须指向同集群的另一个实例。
         """
         super().clean()
 
-        if self.replica_of is None:
-            return
-
         errors = {}
-        if self.replica_of_id == self.pk:
-            errors["replica_of"] = "复制上游不能是自己"
-        elif (
-            self.cluster_id
-            and self.replica_of.cluster_id != self.cluster_id
-        ):
-            errors["replica_of"] = (
-                f"复制上游「{self.replica_of.name}」不属于本集群，"
-                "跨集群的复制关系不在本系统登记范围内"
-            )
+
+        if self.cluster_id and self.role:
+            allowed = self.roles_for_topology(self.cluster.topology)
+            if self.role not in allowed:
+                labels = dict(self.Role.choices)
+                errors["role"] = (
+                    f"集群架构是「{self.cluster.get_topology_display()}」，"
+                    f"实例角色只能是：{'、'.join(labels[r] for r in allowed)}"
+                )
+
+        if self.replica_of is not None:
+            if self.replica_of_id == self.pk:
+                errors["replica_of"] = "复制上游不能是自己"
+            elif self.cluster_id and self.replica_of.cluster_id != self.cluster_id:
+                errors["replica_of"] = (
+                    f"复制上游「{self.replica_of.name}」不属于本集群，"
+                    "跨集群的复制关系不在本系统登记范围内"
+                )
+
         if errors:
             raise ValidationError(errors)
 

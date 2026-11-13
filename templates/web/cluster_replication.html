@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}{{ cluster.name }} · 复制关系编排{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>复制关系编排</h1>
+    <div class="sub">
+      {{ cluster.department.name }} / {{ cluster.name }}
+      · 架构：{{ cluster.get_topology_display }}
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{% url 'web:cluster_detail' cluster.id %}">返回集群</a>
+    <a class="btn" href="{% url 'web:cluster_edit' cluster.id %}">改架构</a>
+  </div>
+</div>
+
+<div class="card">
+  <p class="muted small">
+    架构是集群级配置，「谁复制谁」也在这里统一编排。实例表单只负责选角色，
+    且角色范围由架构决定。留空表示该实例没有复制上游（单机或主库）。
+  </p>
+
+  <form method="post" action="{% url 'web:cluster_replication' cluster.id %}">
+    {% csrf_token %}
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>实例</th>
+            <th>角色</th>
+            <th>连接地址</th>
+            <th>复制上游</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>
+                <a href="{% url 'web:instance_detail' row.instance.id %}">{{ row.instance.name }}</a>
+                {% if row.instance.alias %}<span class="muted small mono">{{ row.instance.alias }}</span>{% endif %}
+              </td>
+              <td>
+                {% if row.instance.role == "master" %}
+                  <span class="badge badge-blue">主库</span>
+                {% elif row.instance.role == "slave" %}
+                  <span class="badge badge-green">从库</span>
+                {% else %}
+                  <span class="badge badge-gray">代理</span>
+                {% endif %}
+              </td>
+              <td class="mono">{{ row.instance.host }}:{{ row.instance.port }}</td>
+              <td>
+                <select class="select" name="upstream_{{ row.instance.id }}">
+                  <option value="">无（单机 / 主库）</option>
+                  {% for other in instances %}
+                    {% if other.id != row.instance.id %}
+                      <option value="{{ other.id }}"
+                        {% if row.upstream_id == other.id %}selected{% endif %}>
+                        {{ other.name }}（{{ other.get_role_display }}）
+                      </option>
+                    {% endif %}
+                  {% endfor %}
+                </select>
+              </td>
+            </tr>
+          {% empty %}
+            <tr><td colspan="4" class="empty">
+              这个集群还没有实例。
+              <a href="{% url 'web:instance_create' %}?cluster_id={{ cluster.id }}">先加一个实例</a>。
+            </td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {% if rows %}
+      <div class="form-actions">
+        <button class="btn btn-primary" type="submit">保存复制关系</button>
+      </div>
+    {% endif %}
+  </form>
+</div>
+
+{% if rows %}
+<div class="card">
+  <h2>按架构一键生成</h2>
+  <p class="muted small">
+    按当前架构推断默认关系：主从让所有从库跟随唯一主库；双主让两台主库互指；
+    单机清空所有上游。分片架构不自动生成——每组分片的主从归属系统无从推断。
+    生成后仍可回到上表微调。
+  </p>
+  <form method="post" action="{% url 'web:cluster_replication_auto' cluster.id %}">
+    {% csrf_token %}
+    <button class="btn" type="submit"
+            onclick="return confirm('将按「{{ cluster.get_topology_display }}」架构覆盖当前复制关系，继续？');">
+      按「{{ cluster.get_topology_display }}」生成
+    </button>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

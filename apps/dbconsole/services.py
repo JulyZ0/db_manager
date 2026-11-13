@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import errno
 import logging
+import re
 import shlex
 import socket
 import time
@@ -55,6 +56,11 @@ ERROR_UNSUPPORTED = "unsupported_engine"
 ERROR_SQL = "sql_error"
 ERROR_UNKNOWN = "unknown"
 
+# 控制台里想直接改目标库口令时返回的专用错误码。
+# 单独开一个码而不是复用 sql_error，是为了让前端能给出"请走轮换入口"的指引，
+# 而不是让运维以为语句写错了、反复重试。
+ERROR_CREDENTIAL_CHANGE = "credential_change_blocked"
+
 # 给运维看的中文说明。刻意不含任何来自驱动/目标的原始文本。
 _ERROR_HINTS = {
     ERROR_AUTH_FAILED: "账号或密码不正确",
@@ -67,6 +73,10 @@ _ERROR_HINTS = {
     ERROR_DRIVER_MISSING: "缺少对应数据库驱动，请先安装",
     ERROR_UNSUPPORTED: "该引擎暂不支持此操作",
     ERROR_SQL: "SQL 执行失败",
+    ERROR_CREDENTIAL_CHANGE: (
+        "控制台不允许直接修改目标库口令，否则本地密码台账会与目标库不一致。"
+        "请改用实例详情页的「立即轮换」"
+    ),
     ERROR_UNKNOWN: "未知错误",
 }
 
@@ -556,6 +566,10 @@ def _execute_postgres(
     started = time.perf_counter()
     conn = None
     try:
+        # connect_timeout 只管"建连"这一段；建连成功之后，一条慢查询会一直
+        # 挂到它自己结束，绕开 DB_QUERY_TIMEOUT_SECONDS 的上限。
+        # psycopg 没有 libpq 级别的读超时，只能用服务端参数 statement_timeout
+        # 让 PG 自己掐断超时语句（单位毫秒）。
         conn = psycopg.connect(
             host=instance.host,
             port=int(instance.port),
@@ -563,6 +577,7 @@ def _execute_postgres(
             password=password,
             dbname="postgres",
             connect_timeout=int(timeout),
+            options=f"-c statement_timeout={int(timeout) * 1000}",
             autocommit=True,
         )
         with conn.cursor() as cur:
@@ -704,29 +719,320 @@ _DDL_KEYWORDS = frozenset(
 # 这些语句无法回滚，且一旦误执行破坏面极大。执行前必须由用户显式确认。
 _DESTRUCTIVE_KEYWORDS = frozenset({"drop", "truncate"})
 
+# Redis 没有 SQL，但同样有"一条命令就造成不可逆后果"的操作。
+# SHUTDOWN 能直接停掉实例；FLUSHALL/FLUSHDB 清空全部数据；
+# CONFIG SET requirepass 会改掉目标库密码（本地台账随之失效）；
+# REPLICAOF/SLAVEOF 会改复制拓扑，可能让从库被主库全量覆盖。
+_REDIS_DESTRUCTIVE_COMMANDS = frozenset(
+    {
+        "flushall",
+        "flushdb",
+        "shutdown",
+        "debug",
+        "swapdb",
+        "replicaof",
+        "slaveof",
+        # KEYS 本身不改数据，但在单线程 Redis 上是 O(N) 全表扫描，
+        # 百万键的实例会被卡住数十秒到数分钟，足以造成一次可用性事故。
+        "keys",
+    }
+)
+
+# 带子命令的写法：CONFIG SET x / CLUSTER RESET / SCRIPT FLUSH
+_REDIS_DESTRUCTIVE_SUBCOMMANDS = {
+    "config": frozenset({"set", "rewrite"}),
+    "cluster": frozenset({"reset", "forget"}),
+    "script": frozenset({"flush"}),
+    "client": frozenset({"kill"}),
+}
+
+# Redis 命令分类：只影响审计里的「语句类型」标签，不参与拦截。
+_REDIS_QUERY_COMMANDS = frozenset(
+    {
+        "get",
+        "mget",
+        "exists",
+        "type",
+        "ttl",
+        "pttl",
+        "strlen",
+        "llen",
+        "lrange",
+        "lindex",
+        "smembers",
+        "sismember",
+        "scard",
+        "zrange",
+        "zscore",
+        "zcard",
+        "hget",
+        "hmget",
+        "hgetall",
+        "hkeys",
+        "hlen",
+        "dbsize",
+        "info",
+        "ping",
+        "scan",
+        "sscan",
+        "hscan",
+        "zscan",
+        "randomkey",
+        "time",
+    }
+)
+_REDIS_WRITE_COMMANDS = frozenset(
+    {
+        "set",
+        "setex",
+        "setnx",
+        "getset",
+        "mset",
+        "incr",
+        "decr",
+        "incrby",
+        "decrby",
+        "del",
+        "unlink",
+        "expire",
+        "pexpire",
+        "persist",
+        "rename",
+        "lpush",
+        "rpush",
+        "lpop",
+        "rpop",
+        "lset",
+        "lrem",
+        "sadd",
+        "srem",
+        "zadd",
+        "zrem",
+        "hset",
+        "hmset",
+        "hdel",
+        "hincrby",
+        "append",
+        "setbit",
+        "eval",
+        "evalsha",
+        "publish",
+    }
+)
+
+
+def _redis_argv(sql: str) -> list[str]:
+    """把一行 Redis 命令切成 argv；解析失败时退化为空白切分。"""
+    try:
+        return shlex.split(sql)
+    except ValueError:
+        return sql.split()
+
+
+def _redis_head(sql: str) -> str:
+    """返回 Redis 命令首词（小写），用于分类与风险判定。"""
+    argv = _redis_argv(sql)
+    return argv[0].lower() if argv else ""
+
+
+def _redis_is_destructive(sql: str) -> bool:
+    """判断 Redis 命令是否会造成不可逆后果。
+
+    判定两层：
+    1. 命令本身在黑名单里（FLUSHALL / SHUTDOWN / KEYS ...）；
+    2. 命令本身中性、但子命令危险（CONFIG SET / CLUSTER RESET ...）。
+
+    大小写不敏感：``flushall`` 与 ``FLUSHALL`` 是同一个命令。
+    """
+    argv = _redis_argv(sql)
+    if not argv:
+        return False
+
+    head = argv[0].lower()
+    if head in _REDIS_DESTRUCTIVE_COMMANDS:
+        return True
+
+    dangerous_subs = _REDIS_DESTRUCTIVE_SUBCOMMANDS.get(head)
+    if dangerous_subs and len(argv) > 1:
+        return argv[1].lower() in dangerous_subs
+
+    return False
+
+
+# 在控制台里改目标库口令的语句。
+#
+# 为什么必须拦
+# ------------
+# 本系统的密码台账（password_ciphertext / password_version /
+# PasswordRotationLog）是"目标库口令"的唯一真相来源：凭据验证、自动轮换、
+# 连接控制台全都读它。绕过台账在控制台直接 ALTER USER ... IDENTIFIED BY，
+# 会造成最恶劣的一种状态——**目标库密码已经变了，本地还是旧密文**：
+#
+#   1. 之后的凭据验证全部 auth_failed，运维以为是密码错了；
+#   2. 自动轮换拿旧密码去连，连不上，实例从此"永久不可轮换"；
+#   3. 控制台自己也连不上了，而台账里看不出任何痕迹。
+#
+# 所以这里不是"提醒风险"，而是直接拒绝：改密必须走 /instances/<id>/rotate/，
+# 那条路径会同时更新目标库与本地台账。
+_CREDENTIAL_CHANGE_PATTERNS = (
+    # MySQL: ALTER USER 'u'@'%' IDENTIFIED BY 'p' / IDENTIFIED WITH ...
+    re.compile(r"\balter\s+user\b.*\bidentified\s+(?:by|with)\b", re.IGNORECASE | re.DOTALL),
+    # MySQL: SET PASSWORD [FOR 'u'@'%'] = 'p'
+    re.compile(r"\bset\s+password\b", re.IGNORECASE),
+    # MySQL: GRANT ... IDENTIFIED BY 'p'
+    re.compile(r"\bgrant\b.*\bidentified\s+by\b", re.IGNORECASE | re.DOTALL),
+    # PostgreSQL: ALTER USER/ROLE x [WITH] PASSWORD 'p'
+    re.compile(
+        r"\balter\s+(?:user|role)\b.*\b(?:encrypted\s+)?password\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+)
+
+# Redis 改口令的两条路径：老式的 CONFIG SET requirepass，以及 ACL 体系。
+_REDIS_CREDENTIAL_CHANGE_PATTERNS = (
+    re.compile(r"\bconfig\s+set\s+requirepass\b", re.IGNORECASE),
+    re.compile(r"\bacl\s+setuser\b", re.IGNORECASE),
+)
+
+
+def changes_credentials(sql: str, engine: str) -> bool:
+    """判断语句是否会修改目标库的登录口令。
+
+    只看归一化后的语句（可执行注释已展开），因此
+    ``/*!50000 ALTER USER 'u'@'%' IDENTIFIED BY 'p'*/`` 同样会被识别。
+    """
+    if engine == "redis":
+        argv_text = sql
+        return any(p.search(argv_text) for p in _REDIS_CREDENTIAL_CHANGE_PATTERNS)
+
+    text = _normalize_sql(sql)
+    if not text:
+        return False
+    return any(p.search(text) for p in _CREDENTIAL_CHANGE_PATTERNS)
+
 ERROR_MULTI_STATEMENT = "multi_statement"
 
 
-def _strip_leading_noise(sql: str) -> str:
-    """去掉开头空白与注释，便于取首关键字。"""
-    text = sql.lstrip()
-    while text.startswith("--") or text.startswith("/*"):
-        if text.startswith("--"):
-            _, _, rest = text.partition("\n")
-            text = rest.lstrip()
-        else:
-            end = text.find("*/")
+def _normalize_sql(sql: str) -> str:
+    """把 SQL 归一化成"服务端实际会执行的样子"，供风险判定使用。
+
+    为什么必须这么做
+    ----------------
+    MySQL 有两种「注释」长得像注释、语义却完全不同：
+
+    - ``/* 普通注释 */``：服务端忽略，剥掉是安全的。
+    - ``/*!50000 DROP TABLE t*/``：**可执行注释**。``!`` 表示"MySQL 会执行
+      这里面的内容"，``50000`` 是版本门限（5.0.0 以上才执行）。服务端实际
+      执行的是 ``DROP TABLE t``，但如果按普通注释剥掉，判定的首关键字就
+      变成了空/后续内容，破坏性识别会被绕过——用户看到的确认提示与实际
+      执行内容不一致，这正是二次确认要防的情况。
+
+    因此这里把可执行注释**展开**（保留内容、去掉版本号），普通注释剥掉，
+    并把 ``#`` 行注释也一并处理（MySQL 支持）。字符串字面量内部一律原样
+    保留，避免误伤 ``SELECT '/*'`` 这类合法语句。
+
+    未闭合的 ``/*!`` 按"剩余内容全部可执行"处理：宁可误报为危险，也不能
+    漏判——漏判的代价是一条未经确认执行的 DROP。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    quote: str | None = None
+
+    while i < n:
+        ch = sql[i]
+
+        # -- 字符串 / 标识符内部原样保留 ----------------------------------
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                # MySQL 默认把反斜杠当转义符，连同下一个字符一起复制
+                out.append(sql[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                # 两个连续引号是转义（'' 或 ""），不算结束
+                if i + 1 < n and sql[i + 1] == quote:
+                    out.append(sql[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        # -- 行注释 ------------------------------------------------------
+        if ch == "#" or (ch == "-" and i + 1 < n and sql[i + 1] == "-"):
+            end = sql.find("\n", i)
             if end == -1:
-                return ""
-            text = text[end + 2 :].lstrip()
-    return text
+                break
+            i = end  # 保留换行本身
+            continue
+
+        # -- 块注释 / 可执行注释 -----------------------------------------
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            executable = i + 2 < n and sql[i + 2] == "!"
+            end = sql.find("*/", i + 2)
+            if end == -1:
+                # 未闭合：普通注释视为到结尾；可执行注释把剩余内容全放出
+                body = sql[i + 2 :]
+                if executable:
+                    # 这里不能 strip 版本号后就丢内容，保守全部放出
+                    body = body.lstrip("!")
+                    body = re.sub(r"^\d{0,6}", "", body, count=1)
+                    out.append(" " + body + " ")
+                break
+
+            if executable:
+                body = sql[i + 2 : end]  # 跳过 "/*!"
+                body = body.lstrip("!")
+                # 去掉可选版本号（最多 5-6 位数字），后面才是真正的 SQL
+                body = re.sub(r"^\d{0,6}", "", body, count=1)
+                # 用空格包裹，避免与相邻 token 粘连（a/*!...*/b）
+                out.append(" " + body + " ")
+            # 普通注释直接丢弃
+            i = end + 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
-def classify_statement(sql: str) -> str:
-    """判断语句类型，用于审计与风险提示。"""
+def _strip_leading_noise(sql: str) -> str:
+    """归一化后去掉开头空白与空语句分号，便于取首关键字。
+
+    跳过前导 ``;`` 是为了对付 ``/*!50000 ; DROP TABLE t */`` 这类写法：
+    可执行注释展开后内容就成了 ``; DROP TABLE t``，服务端执行到的就是
+    DROP，但首字符是分号会让判定落空，等于绕过二次确认。
+    """
+    return _normalize_sql(sql).lstrip().lstrip(";").lstrip()
+
+
+def classify_statement(sql: str, engine: str | None = None) -> str:
+    """判断语句类型，用于审计与风险提示。
+
+    Redis 不是 SQL，按命令首词分类：读类命令算 query，写类命令算 write，
+    其余（含危险命令）归为 other，由 ``is_destructive`` 单独判定风险。
+    """
     text = _strip_leading_noise(sql)
     if not text:
         return "other"
+
+    if engine == "redis":
+        head = _redis_head(sql)
+        if head in _REDIS_QUERY_COMMANDS:
+            return "query"
+        if head in _REDIS_WRITE_COMMANDS:
+            return "write"
+        return "other"
+
     head = text.split(None, 1)[0].lower().strip("(")
 
     if head in _QUERY_KEYWORDS:
@@ -740,16 +1046,94 @@ def classify_statement(sql: str) -> str:
     return "other"
 
 
-def is_destructive(sql: str) -> bool:
-    """是否为破坏性语句（DROP / TRUNCATE）。
+def _has_top_level_where(text: str) -> bool:
+    """判断语句在顶层（不在括号、不在引号内）是否出现 WHERE 关键字。
 
-    这类语句无法回滚，页面上要求二次确认；API 层要求显式传 confirm=true。
+    为什么必须区分"顶层"
+    --------------------
+    ``DELETE FROM t WHERE id IN (SELECT id FROM x WHERE ...)`` 的条件在子查询
+    里，但外层仍然是全表删除。只看"文本里有没有 where"会把这种情况误判成
+    "有条件的删除"，放过一次清表操作。因此只在括号深度为 0 时认 WHERE。
+
+    引号内的 where 只是字面量（``SET note='where'``），同样不算条件。
     """
+    depth = 0
+    quote: str | None = None
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+
+        if quote is not None:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                if i + 1 < n and text[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+
+        if ch in ("'", '"', "`"):
+            quote = ch
+            i += 1
+            continue
+
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+
+        if depth == 0 and (ch.isalpha() or ch == "_"):
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            if text[i:j].lower() == "where":
+                return True
+            i = j
+            continue
+
+        i += 1
+
+    return False
+
+
+def is_destructive(sql: str, engine: str | None = None) -> bool:
+    """是否为破坏性语句，是则由调用方要求二次确认。
+
+    SQL 侧两类：
+    1. DROP / TRUNCATE —— 直接销毁结构或数据，无法回滚；
+    2. **不带 WHERE 的 DELETE / UPDATE** —— 一行语句清空整表。它比 DROP
+       更隐蔽：运维往往以为自己只删几行，实际影响面是全表，而且执行成功
+       之后才看得出来。
+
+    Redis 侧见 ``_REDIS_DESTRUCTIVE_COMMANDS``：这些命令一条就能清空数据、
+    停掉实例或改掉认证口令，危害与 DROP TABLE 同级。
+
+    ``engine`` 缺省时按 SQL 判定，保持既有调用方兼容。
+    """
+    if engine == "redis":
+        return _redis_is_destructive(sql)
+
     text = _strip_leading_noise(sql)
     if not text:
         return False
     head = text.split(None, 1)[0].lower().strip("(")
-    return head in _DESTRUCTIVE_KEYWORDS
+
+    if head in _DESTRUCTIVE_KEYWORDS:
+        return True
+
+    if head in {"delete", "update"}:
+        return not _has_top_level_where(text)
+
+    return False
 
 
 def _split_top_level(text: str, sep: str = ";") -> list[str]:
@@ -799,6 +1183,24 @@ def _split_top_level(text: str, sep: str = ";") -> list[str]:
             i = end
             continue
 
+        # 块注释：普通注释内容整段跳过（里面的分号不是语句分隔符）；
+        # 可执行注释 /*! ... */ 里的内容是服务端真正会执行的，继续按分号
+        # 切分，否则 "SELECT 1 /*!50000 ; DROP TABLE t */" 会被看成一整条。
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            executable = i + 2 < n and text[i + 2] == "!"
+            end = text.find("*/", i + 2)
+            if end == -1:
+                # 未闭合：普通注释视为到结尾；可执行注释把剩余内容当活代码
+                if executable:
+                    buf.append(text[i + 2 :])
+                break
+            if executable:
+                buf.append(" ")
+                buf.append(text[i + 2 : end])
+                buf.append(" ")
+            i = end + 2
+            continue
+
         if ch == sep:
             parts.append("".join(buf))
             buf = []
@@ -843,11 +1245,14 @@ def record_audit(
     try:
         from apps.dbconsole.models import StatementAuditLog
 
+        engine = engine_of(instance)
         StatementAuditLog.objects.create(
             instance=instance,
+            # 名称快照：实例被删后 FK 置空，这行文字是唯一的定位线索
+            instance_label=f"{instance.name} ({instance.host}:{instance.port})"[:200],
             user_label=user_label[:64],
-            engine=engine_of(instance)[:20],
-            kind=classify_statement(statement),
+            engine=engine[:20],
+            kind=classify_statement(statement, engine),
             statement_preview=statement[:500],
             ok=result.ok,
             row_count=result.row_count,
@@ -899,6 +1304,23 @@ def execute_statement(
             ok=False,
             error=blocked,
             message="一次只能执行一条语句，请分开提交",
+        )
+        record_audit(
+            instance,
+            user_label=user_label,
+            statement=statement,
+            result=result,
+        )
+        return result
+
+    # 改密语句必须走轮换入口，否则本地台账与目标库会永久错位（见
+    # _CREDENTIAL_CHANGE_PATTERNS 的说明）。这里同样在建连之前拒绝：
+    # 一旦连上去执行成功，坏状态就已经产生了，事后再提示没有意义。
+    if changes_credentials(statement, engine):
+        result = QueryResult(
+            ok=False,
+            error=ERROR_CREDENTIAL_CHANGE,
+            message=_ERROR_HINTS[ERROR_CREDENTIAL_CHANGE],
         )
         record_audit(
             instance,

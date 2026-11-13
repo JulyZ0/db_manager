@@ -267,6 +267,33 @@ class RotationPolicy(models.Model):
         # 显式勾选的实例即使属于未勾选的集群也要包含
         return list(qs.order_by("id").values_list("id", flat=True))
 
+    def includes_instance(self, instance_id: int) -> bool:
+        """单个实例是否在轮换范围内，供详情页这类"只问一个是非"的场景用。
+
+        为什么单独开一个方法
+        --------------------
+        详情页只需要一个布尔值。若复用 ``resolve_instance_ids()``，每次打开
+        页面都要把全部启用实例的 id 拉成列表再转集合：实例上千时是 O(N)
+        的传输与内存开销，只为回答"这一个在不在里面"。
+
+        这里把判断下推给数据库：范围为空时退化成一次 ``is_active`` 查询；
+        有范围时用 ``values("id")`` 子查询，不在 Python 侧搬运任何 id 列表。
+        语义与 ``resolve_instance_ids()`` 严格一致。
+        """
+        from apps.assets.models import Instance
+
+        base = Instance.objects.filter(pk=instance_id, is_active=True)
+
+        # 短路求值：clusters 非空就不必再查 instances
+        if not self.clusters.exists() and not self.instances.exists():
+            # 留空 = 全部启用实例
+            return base.exists()
+
+        return base.filter(
+            models.Q(cluster_id__in=self.clusters.values("id"))
+            | models.Q(id__in=self.instances.values("id"))
+        ).exists()
+
     def scope_label(self) -> str:
         cluster_count = self.clusters.count()
         instance_count = self.instances.count()

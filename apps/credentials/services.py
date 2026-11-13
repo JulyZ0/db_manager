@@ -52,6 +52,11 @@ DEFAULT_CONCURRENCY = 4
 # 单个实例轮换超过这个耗时说明有问题（正常在毫秒级）
 SLOW_ROTATION_MS = 1000
 
+# 批量取实例时单条 SQL 的 id 上限。
+# SQLite 3.32+ 的绑定变量上限是 32766，PostgreSQL 是 65535；
+# 取 500 既远离上限，也让单条 SQL 的解析开销保持在低位。
+_INSTANCE_LOOKUP_CHUNK = 500
+
 
 def _record_failure(
     instance: Instance,
@@ -355,14 +360,33 @@ def _rotate_chunk(
     单条失败只计数不抛出——rotate_one 已经写好 failed 历史。
     结束时关闭本线程的数据库连接：线程池的工作线程会复用，
     但连接若不复位会一直挂在已结束的线程上。
+
+    这里按批一次性把实例查出来，而不是在循环里逐个
+    ``Instance.objects.filter(pk=...)``：后者一批 100 条就是 100 次查询，
+    每次都要往返数据库（跨网络时更明显）。批量查只发一条
+    ``pk__in`` 查询，再用字典按 id 取，顺序仍按传入的 ids。
     """
     ok = 0
     bad = 0
     owned_thread = threading.current_thread() is not threading.main_thread()
 
     try:
+        # 分批取，避免调用方传入超大 batch_size 时触发数据库的
+        # 绑定变量数量上限（SQLite 上表现为 "too many SQL variables"）。
+        by_id: dict[int, Instance] = {}
+        for start in range(0, len(ids), _INSTANCE_LOOKUP_CHUNK):
+            window = ids[start : start + _INSTANCE_LOOKUP_CHUNK]
+            by_id.update(
+                {
+                    item.pk: item
+                    for item in Instance.objects.select_related("cluster").filter(
+                        pk__in=window
+                    )
+                }
+            )
+
         for instance_id in ids:
-            instance = Instance.objects.filter(pk=instance_id).first()
+            instance = by_id.get(instance_id)
             if instance is None:
                 # 批次查询与处理之间被删除，跳过即可
                 continue

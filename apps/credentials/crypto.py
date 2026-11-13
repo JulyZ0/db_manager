@@ -102,14 +102,25 @@ def encrypt_secret(plaintext: str) -> str:
     return f"{CURRENT_KEY_VERSION}{CIPHERTEXT_SEPARATOR}{token}"
 
 
-@lru_cache(maxsize=512)
 def decrypt_secret(ciphertext: str) -> str:
     """解密 `v1:<token>`，返回明文；空字符串原样返回 ""。
 
-    缓存的是"密文 → 明文"的映射，key 不含明文，调用方拿不到额外信息。
+    这里**故意不加 lru_cache**（此前加过 maxsize=512，已移除）。
 
-    注意：若运行期更换了 FIELD_ENCRYPTION_KEY，本缓存会返回旧密钥解出的值。
-    密钥轮换属于运维动作，换密钥后必须重启进程（缓存随之清空）。
+    缓存的是"密文 → 明文"的映射，看上去 key 不含明文，但 value 就是明文
+    本身：最多 512 个实例的登录口令会常驻进程堆内存，直到进程退出或被覆盖。
+    代价很不划算：
+
+    - 收益：省下一次 AES 解密，量级是微秒。相对于紧接着要做的 TCP 建连
+      （毫秒到秒级）完全可忽略。
+    - 风险：core dump、内存转储、debugger 附加、堆内存泄露，都会一次性
+      暴露全部实例口令；而这些明文本来只需要存活一次连接的时间。
+
+    Fernet 实例的缓存（``_build_fernet``）保留——它不含任何明文或密文，
+    重复构造只是多一次 base64 解码与长度校验。
+
+    注意：若运行期更换了 FIELD_ENCRYPTION_KEY，解密会失败（密钥不匹配），
+    换密钥后必须重启进程并重新登记密码。
     """
     if not ciphertext:
         return ""
@@ -164,12 +175,15 @@ def generate_password(length: int | None = None) -> str:
     return "".join(chars)
 
 
-@lru_cache(maxsize=512)
 def fingerprint(secret: str) -> str:
     """密码指纹：sha256 前 16 位十六进制。
 
     用于轮换历史审计：可比较两个密码是否相同，但不可逆推出明文。
     只保存指纹，永不保存明文或密文，这是 PRD SEC-5 的要求。
+
+    不加 lru_cache：缓存 key 就是明文密码本身，等于把这些口令按原文
+    常驻进程内存，和"永不保存明文"的口径直接冲突；何况 sha256 只有
+    微秒级开销，缓存换不来任何有意义的收益。
     """
     if not secret:
         return ""

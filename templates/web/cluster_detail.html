@@ -19,6 +19,7 @@
   </div>
   <div class="actions">
     <a class="btn btn-primary" href="{% url 'web:instance_create' %}?cluster_id={{ cluster.id }}">加实例</a>
+    <a class="btn" href="{% url 'web:cluster_replication' cluster.id %}">编排复制关系</a>
     <a class="btn" href="{% url 'web:cluster_edit' cluster.id %}">编辑集群</a>
     <a class="btn" href="{% url 'web:instance_list' %}?cluster_id={{ cluster.id }}">实例列表</a>
     <a class="btn" href="{% url 'web:cluster_list' %}">返回</a>

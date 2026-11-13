@@ -320,3 +320,39 @@ class TestScopeResolution:
 
         policy.instances.set([a])
         assert policy.scope_label() == "1 个集群 + 1 个实例"
+
+
+class TestIncludesInstance:
+    """``includes_instance`` 必须与 ``resolve_instance_ids`` 语义完全等价。
+
+    前者是后者的"只问一个是非"版本，供详情页这类单点判断使用。两者一旦
+    分叉，就会出现"详情页说会被轮换、实际批量轮换却没轮到它"这种灵异现象，
+    而这类不一致极难从现象倒推原因。
+    """
+
+    def test_equivalent_to_resolve_instance_ids(self, two_clusters):
+        _, c1, c2 = two_clusters
+        a = _instance(c1, "a", "10.0.0.1")
+        b = _instance(c1, "b", "10.0.0.2")
+        c = _instance(c2, "c", "10.0.0.3")
+        stopped = _instance(c2, "stopped", "10.0.0.4", active=False)
+        everyone = [a, b, c, stopped]
+
+        policy = RotationPolicy.load()
+        scenarios = [
+            {},                                  # 空范围 = 全部启用
+            {"clusters": [c1]},
+            {"instances": [c]},
+            {"clusters": [c1], "instances": [c]},
+            {"instances": [stopped]},            # 停用优先
+        ]
+        for setup in scenarios:
+            policy.clusters.set(setup.get("clusters", []))
+            policy.instances.set(setup.get("instances", []))
+            expected = set(policy.resolve_instance_ids())
+            for item in everyone:
+                assert policy.includes_instance(item.id) is (item.id in expected)
+
+    def test_unknown_instance_is_excluded(self, two_clusters):
+        policy = RotationPolicy.load()
+        assert policy.includes_instance(999999) is False

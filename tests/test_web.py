@@ -25,6 +25,8 @@ def seeded():
         department=dept,
         engine=Cluster.Engine.MYSQL,
         env=Cluster.Env.PROD,
+        # 用例里要建从库实例，架构必须是主从：架构决定可选角色
+        topology=Cluster.Topology.MASTER_SLAVE,
     )
     instance = Instance.objects.create(
         name="core-01",
@@ -401,6 +403,48 @@ class TestNoSecretLeak:
 
 
 # ---------------------------------------------------------------------------
+# CSRF：生产下 cookie 是 HttpOnly，前端只能从 DOM 拿 token
+# ---------------------------------------------------------------------------
+
+
+class TestCsrfTokenInDom:
+    """生产口径（DEBUG=False）下 CSRF_COOKIE_HTTPONLY=True。
+
+    此时 JS 读不到 csrftoken cookie，凡是靠 document.cookie 取 token 的写法
+    都会静默拿到空串，结果是所有写操作 403。所以页面必须把 token 渲染进
+    <meta name="csrf-token">，由 JS 从 DOM 读。
+    """
+
+    def test_pages_expose_csrf_meta(self, api_client, seeded):
+        for path in ["/", "/instances/", "/console/"]:
+            body = api_client.get(path).content.decode()
+            assert '<meta name="csrf-token" content="' in body, path
+
+    def test_csrf_meta_is_not_empty(self, api_client):
+        body = api_client.get("/").content.decode()
+        start = body.index('<meta name="csrf-token" content="')
+        start += len('<meta name="csrf-token" content="')
+        token = body[start : body.index('"', start)]
+        assert len(token) >= 32, "CSRF token 为空或被模板当成变量名原样输出"
+
+    def test_console_js_reads_token_from_dom(self):
+        """两个前端取 token 的入口都必须先读 meta，而不是先读 cookie。"""
+        from pathlib import Path
+
+        from django.conf import settings
+
+        js = Path(settings.BASE_DIR) / "static" / "js" / "quick_console.js"
+        body = js.read_text(encoding="utf-8")
+        assert 'meta[name="csrf-token"]' in body
+
+        # 页面内联脚本同样要读 meta
+        from django.template.loader import render_to_string
+
+        page = render_to_string("web/console.html")
+        assert 'meta[name="csrf-token"]' in page
+
+
+# ---------------------------------------------------------------------------
 # 详情页凭据验证（异步自动执行）
 # ---------------------------------------------------------------------------
 
@@ -499,6 +543,86 @@ def test_verify_endpoint_404_for_missing_instance(api_client):
     assert resp.status_code == 404
 
 
+class TestVerifyEndpointIsLogged:
+    """验证端点保持匿名可访问，但每次调用都要留痕。
+
+    这个端点会用登记的真实凭据发起主动连接，属于有副作用的操作：
+    匿名者能拿它刷目标库连接数，也能借 error 码 + 响应耗时做内网探测。
+    口径是"不拦、但要能追溯"，所以日志里必须有操作人与来源 IP。
+    """
+
+    def test_anonymous_can_still_verify(self, anon_client, seeded, monkeypatch, caplog):
+        from apps.dbconsole import services
+
+        monkeypatch.setattr(
+            "apps.dbconsole.services.verify_credentials",
+            lambda instance, timeout=None: services.ConnectionInfo(
+                ok=True, engine="mysql", latency_ms=7
+            ),
+        )
+
+        with caplog.at_level("INFO"):
+            resp = anon_client.get(
+                f"/instances/{seeded['instance'].id}/verify-credentials/"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert any("凭据验证" in r.message for r in caplog.records)
+
+    def test_log_records_actor_and_ip(self, api_client, login_user, seeded, monkeypatch, caplog):
+        from apps.dbconsole import services
+
+        monkeypatch.setattr(
+            "apps.dbconsole.services.verify_credentials",
+            lambda instance, timeout=None: services.ConnectionInfo(ok=True, engine="mysql"),
+        )
+
+        with caplog.at_level("INFO"):
+            api_client.get(
+                f"/instances/{seeded['instance'].id}/verify-credentials/",
+                REMOTE_ADDR="10.20.30.40",
+            )
+
+        line = next(r.getMessage() for r in caplog.records if "凭据验证" in r.message)
+        assert login_user.username in line
+        assert "10.20.30.40" in line
+
+    def test_console_verify_is_logged_too(self, api_client, seeded, monkeypatch, caplog):
+        from apps.dbconsole import services
+
+        monkeypatch.setattr(
+            "apps.dbconsole.services.verify_credentials",
+            lambda instance, timeout=None: services.ConnectionInfo(ok=True, engine="mysql"),
+        )
+
+        with caplog.at_level("INFO"):
+            resp = api_client.get(f"/console/{seeded['instance'].id}/verify.json")
+
+        assert resp.status_code == 200
+        assert any("控制台凭据验证" in r.message for r in caplog.records)
+
+
+def test_client_ip_ignores_spoofable_header_by_default(settings):
+    """默认不采信 X-Forwarded-For：该头客户端可任意伪造。"""
+    from django.test import RequestFactory
+
+    from common.request import client_ip
+
+    settings.TRUST_PROXY_HEADERS = False
+    request = RequestFactory().get(
+        "/", HTTP_X_FORWARDED_FOR="1.2.3.4", REMOTE_ADDR="10.0.0.9"
+    )
+    assert client_ip(request) == "10.0.0.9"
+
+    # 明确跑在反向代理之后时才取 XFF，且取最后一段（前面的客户端可伪造）
+    settings.TRUST_PROXY_HEADERS = True
+    request = RequestFactory().get(
+        "/", HTTP_X_FORWARDED_FOR="1.2.3.4, 10.0.0.9", REMOTE_ADDR="127.0.0.1"
+    )
+    assert client_ip(request) == "10.0.0.9"
+
+
 # ---------------------------------------------------------------------------
 # 终端风格控制台
 # ---------------------------------------------------------------------------
@@ -528,6 +652,10 @@ def test_console_instances_lists_all(anon_client, seeded):
     assert resp.status_code == 200
     data = resp.json()
     assert data["count"] == 1
+    # 与其它列表接口同一套分页口径
+    assert data["page"] == 1
+    assert data["page_size"] == 20
+    assert data["has_next"] is False
     item = data["results"][0]
     assert item["endpoint"] == "10.0.0.1:3306"
     assert item["label"] == "基础架构部/core-mysql-prod/core-01"
@@ -537,6 +665,45 @@ def test_console_instances_lists_all(anon_client, seeded):
     assert item["password_set"] is True
     assert "password" not in item
     assert "password_ciphertext" not in item
+
+
+def test_console_instances_paginates(anon_client, seeded):
+    """一批实例一次只回一页，避免控制台被大响应体拖住。"""
+    cluster = seeded["cluster"]
+    # cluster + host + port 有唯一约束，用不同端口区分
+    Instance.objects.bulk_create(
+        [
+            Instance(
+                name=f"bulk-{i:02d}", cluster=cluster, host="10.0.0.2", port=3400 + i
+            )
+            for i in range(5)
+        ]
+    )
+
+    first = anon_client.get("/console/instances.json?page=1&page_size=2").json()
+    assert first["count"] == 6
+    assert first["page_size"] == 2
+    assert len(first["results"]) == 2
+    assert first["has_next"] is True
+
+    last = anon_client.get("/console/instances.json?page=3&page_size=2").json()
+    assert len(last["results"]) == 2
+    assert last["has_next"] is False
+
+
+def test_console_instances_bad_params_fall_back_to_defaults(anon_client, seeded):
+    """控制台是自由文本输入，`list abc` 不能把接口打成 500。"""
+    data = anon_client.get("/console/instances.json?page=abc&page_size=xyz").json()
+
+    assert data["page"] == 1
+    assert data["page_size"] == 20
+
+
+def test_console_instances_page_size_is_capped(anon_client, seeded):
+    """page_size 上限 100，防止有人用它当批量导出接口。"""
+    data = anon_client.get("/console/instances.json?page_size=100000").json()
+
+    assert data["page_size"] <= 100
 
 
 def test_console_switch_by_instance_id(anon_client, seeded):

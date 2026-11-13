@@ -130,12 +130,15 @@ def execute_on_instance(request: HttpRequest, instance_id: int, payload: Execute
     if check_statement(sql, engine_of(instance)) == ERROR_MULTI_STATEMENT:
         raise ValidationFailedError("一次只能执行一条语句，请分开提交")
 
-    destructive = is_destructive(sql)
+    destructive = is_destructive(sql, engine_of(instance))
     if destructive and not payload.confirm:
         raise ConflictError(
             "该语句会不可逆地删除数据或结构，请确认后重试",
             code="CONFIRM_REQUIRED",
-            detail={"destructive": True, "statement_kind": classify_statement(sql)},
+            detail={
+                "destructive": True,
+                "statement_kind": classify_statement(sql, engine_of(instance)),
+            },
         )
 
     user_label = ""

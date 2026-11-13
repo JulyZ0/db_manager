@@ -4,6 +4,12 @@ django-ninja>=1.8,<2.0
 celery>=5.7,<6.0
 cryptography>=42.0
 
+# 生产静态文件与 WSGI 服务
+# DEBUG=False 时 runserver 不再服务 /static/，必须由 whitenoise 接管；
+# waitress 是纯 Python 的 WSGI 服务器，Windows 上不需要编译，双击即可跑。
+whitenoise>=6.6
+waitress>=3.0
+
 # Celery 模式需要 Redis；进程内调度模式不需要
 redis>=5.0
 
