@@ -7,6 +7,11 @@ cryptography>=42.0
 # Celery 模式需要 Redis；进程内调度模式不需要
 redis>=5.0
 
+# 目标库连接驱动（控制台「连接」与「执行 SQL」用）
+pymysql>=1.1
+psycopg[binary]>=3.1
+pymongo>=4.6
+
 # 生产环境数据库驱动（默认 SQLite 无需安装）
 # psycopg[binary]>=3.1
 

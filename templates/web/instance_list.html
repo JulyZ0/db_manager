@@ -73,6 +73,7 @@
           <tr>
             <td>
               <a href="{% url 'web:instance_detail' instance.id %}"><strong>{{ instance.name }}</strong></a>
+              {% if instance.alias %}<span class="muted small mono">{{ instance.alias }}</span>{% endif %}
               {% if not instance.is_active %}<span class="badge badge-gray">已停用</span>{% endif %}
             </td>
             <td>{{ instance.cluster.department.name }} / {{ instance.cluster.name }}</td>

@@ -26,6 +26,8 @@
          class="{% if active_nav == 'stats' %}active{% endif %}">数量统计</a>
       <a href="{% url 'web:slow_requests' %}"
          class="{% if active_nav == 'slow' %}active{% endif %}">慢请求</a>
+      <a href="{% url 'web:console' %}"
+         class="{% if active_nav == 'console' %}active{% endif %}">控制台</a>
       <a href="/api/v1/docs" target="_blank">接口文档</a>
       <a href="/admin/" target="_blank">后台管理</a>
     </nav>

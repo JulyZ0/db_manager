@@ -91,6 +91,7 @@ from apps.assets.api import (  # noqa: E402
     instances_router,
 )
 from apps.credentials.api import router as credentials_router  # noqa: E402
+from apps.dbconsole.api import router as dbconsole_router  # noqa: E402
 from apps.metrics.api import router as metrics_router  # noqa: E402
 from apps.probing.api import router as probing_router  # noqa: E402
 
@@ -99,4 +100,5 @@ api.add_router("/clusters", clusters_router)
 api.add_router("/instances", instances_router)
 api.add_router("/instances", probing_router)
 api.add_router("/instances", credentials_router)
+api.add_router("/instances", dbconsole_router)
 api.add_router("/stats", metrics_router)

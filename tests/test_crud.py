@@ -190,6 +190,80 @@ class TestClusterCRUD:
         assert resp.status_code == 409
         assert resp.json()["detail"]["instance_count"] == 1
 
+    def test_create_with_alias_returns_it(self, api_client, dept):
+        resp = api_client.post(
+            "/api/v1/clusters",
+            data={"name": "交易主库", "alias": "jq1", "department_id": dept["id"]},
+            content_type="application/json",
+        )
+        assert resp.status_code == 201
+        assert resp.json()["alias"] == "jq1"
+
+    def test_duplicate_alias_returns_409(self, api_client, dept, cluster):
+        """集群别名全局唯一：跨部门也不能重复。"""
+        other = api_client.post(
+            "/api/v1/departments", data={"name": "研发部"}, content_type="application/json"
+        ).json()
+        api_client.patch(
+            f"/api/v1/clusters/{cluster['id']}",
+            data={"alias": "jq1"},
+            content_type="application/json",
+        )
+        resp = api_client.post(
+            "/api/v1/clusters",
+            data={"name": "另一个", "alias": "jq1", "department_id": other["id"]},
+            content_type="application/json",
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["field"] == "alias"
+
+    def test_all_digit_alias_rejected(self, api_client, dept):
+        resp = api_client.post(
+            "/api/v1/clusters",
+            data={"name": "c-digit", "alias": "123", "department_id": dept["id"]},
+            content_type="application/json",
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["field"] == "alias"
+
+    def test_alias_with_special_chars_rejected(self, api_client, dept):
+        for bad in ("jq 1", "jq@1", "jq.1", "jq;1"):
+            resp = api_client.post(
+                "/api/v1/clusters",
+                data={"name": f"c-{bad}", "alias": bad, "department_id": dept["id"]},
+                content_type="application/json",
+            )
+            assert resp.status_code == 409, bad
+
+    def test_patch_can_clear_alias(self, api_client, dept, cluster):
+        api_client.patch(
+            f"/api/v1/clusters/{cluster['id']}",
+            data={"alias": "jq1"},
+            content_type="application/json",
+        )
+        resp = api_client.patch(
+            f"/api/v1/clusters/{cluster['id']}",
+            data={"alias": None},
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+        assert resp.json()["alias"] is None
+
+    def test_patch_keeps_own_alias(self, api_client, dept, cluster):
+        """把别名改成自己原来的值不算冲突。"""
+        api_client.patch(
+            f"/api/v1/clusters/{cluster['id']}",
+            data={"alias": "jq1"},
+            content_type="application/json",
+        )
+        resp = api_client.patch(
+            f"/api/v1/clusters/{cluster['id']}",
+            data={"alias": "jq1", "env": "test"},
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+        assert resp.json()["alias"] == "jq1"
+
 
 # ---------------------------------------------------------------------------
 # 实例

@@ -473,6 +473,94 @@ class TestRotateAll:
             rotate_all(batch_size=0)
 
 
+class TestRotateAllScope:
+    """按策略范围轮换：只动勾选到的实例，长度按档位生成。"""
+
+    def _make(self, cluster, name, host, **kwargs):
+        return Instance.objects.create(
+            name=name, cluster=cluster, host=host, port=3306, username="u", **kwargs
+        )
+
+    def test_instance_ids_limits_scope(self, cluster):
+        from apps.credentials.services import rotate_all
+
+        a = self._make(cluster, "a", "10.9.0.1")
+        b = self._make(cluster, "b", "10.9.0.2")
+
+        stats = rotate_all(instance_ids=[a.id])
+        assert stats == {"success": 1, "failed": 0, "total": 1}
+
+        a.refresh_from_db()
+        b.refresh_from_db()
+        assert a.password_version == 1
+        assert b.password_version == 0, "范围外的实例绝不能被改动"
+
+    def test_empty_scope_rotates_nothing(self, cluster):
+        """空范围必须一条都不改，绝不能静默退化成全量轮换。"""
+        from apps.credentials.services import rotate_all
+
+        self._make(cluster, "a", "10.9.1.1")
+        self._make(cluster, "b", "10.9.1.2")
+
+        stats = rotate_all(instance_ids=[])
+        assert stats == {"success": 0, "failed": 0, "total": 0}
+        assert Instance.objects.filter(password_version=0).count() == 2
+
+    def test_scope_still_excludes_inactive(self, cluster):
+        from apps.credentials.services import rotate_all
+
+        active = self._make(cluster, "on", "10.9.2.1")
+        off = self._make(cluster, "off", "10.9.2.2", is_active=False)
+
+        stats = rotate_all(instance_ids=[active.id, off.id])
+        assert stats["total"] == 1
+        off.refresh_from_db()
+        assert off.password_version == 0
+
+    def test_scope_combines_with_batching(self, cluster):
+        from apps.credentials.services import rotate_all
+
+        chosen = [self._make(cluster, f"c{i}", f"10.9.3.{i}").id for i in range(5)]
+        for i in range(5):
+            self._make(cluster, f"skip{i}", f"10.9.4.{i}")
+
+        stats = rotate_all(batch_size=2, instance_ids=chosen)
+        assert stats == {"success": 5, "failed": 0, "total": 5}
+        assert Instance.objects.filter(password_version=1).count() == 5
+
+    def test_scope_accepts_string_ids(self, cluster):
+        """表单/JSON 传进来的 id 可能是字符串，不能被静默丢掉。"""
+        from apps.credentials.services import rotate_all
+
+        a = self._make(cluster, "a", "10.9.5.1")
+
+        stats = rotate_all(instance_ids=[str(a.id)])
+        assert stats["total"] == 1
+
+    def test_password_length_applied(self, cluster):
+        """策略里的长度档位必须真正作用到新密码上。"""
+        from apps.credentials.crypto import decrypt_secret
+        from apps.credentials.services import rotate_all
+
+        a = self._make(cluster, "a", "10.9.6.1")
+
+        rotate_all(instance_ids=[a.id], password_length=48)
+        a.refresh_from_db()
+        plaintext = decrypt_secret(a.password_ciphertext)
+        assert len(plaintext) == 48
+
+    def test_password_length_defaults_to_settings(self, cluster, settings):
+        from apps.credentials.crypto import decrypt_secret
+        from apps.credentials.services import rotate_all
+
+        settings.PASSWORD_LENGTH = 16
+        a = self._make(cluster, "a", "10.9.7.1")
+
+        rotate_all(instance_ids=[a.id])
+        a.refresh_from_db()
+        assert len(decrypt_secret(a.password_ciphertext)) == 16
+
+
 # ---------------------------------------------------------------------------
 # metrics/services.py — aggregate_for_date
 # ---------------------------------------------------------------------------

@@ -50,6 +50,12 @@ urlpatterns = [
     path(
         "instances/<int:instance_id>/probe/", views.instance_probe, name="instance_probe"
     ),
+    # 详情页打开后异步调用：只读验证凭据，不落库
+    path(
+        "instances/<int:instance_id>/verify-credentials/",
+        views.instance_verify_credentials,
+        name="instance_verify_credentials",
+    ),
     path(
         "instances/<int:instance_id>/rotate/",
         views.instance_rotate,
@@ -60,4 +66,18 @@ urlpatterns = [
     path("stats/rebuild/", views.stats_rebuild, name="stats_rebuild"),
     # 慢请求
     path("slow-requests/", views.slow_requests, name="slow_requests"),
+    # 终端风格控制台
+    path("console/", views.console, name="console"),
+    path("console/instances.json", views.console_instances, name="console_instances"),
+    path("console/switch.json", views.console_switch, name="console_switch"),
+    path(
+        "console/<int:instance_id>/verify.json",
+        views.console_verify,
+        name="console_verify",
+    ),
+    path(
+        "console/<int:instance_id>/exec/",
+        views.console_exec,
+        name="console_exec",
+    ),
 ]

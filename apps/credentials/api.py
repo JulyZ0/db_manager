@@ -14,6 +14,7 @@ from ninja import Query, Router, Schema
 from apps.assets.models import Instance, PasswordRotationLog
 from apps.assets.schemas import PagedRotationLogOut, RotationLogOut
 from apps.credentials.services import rotate_one
+from common.auth import django_session_auth
 from common.exceptions import ConflictError, NotFoundError
 from common.pagination import paginate_queryset
 
@@ -32,6 +33,7 @@ class RotateOut(Schema):
     "/{instance_id}/rotate-password",
     response=RotateOut,
     summary="手动触发一次密码轮换",
+    auth=django_session_auth,
 )
 def rotate_instance_password(request: HttpRequest, instance_id: int):
     instance = Instance.objects.filter(id=instance_id).first()

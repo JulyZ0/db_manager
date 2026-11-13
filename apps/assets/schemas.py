@@ -63,6 +63,8 @@ class PagedDepartmentOut(Schema):
 
 class ClusterIn(Schema):
     name: str = Field(min_length=1, max_length=100)
+    # 集群别名全局唯一，控制台里可单独作为前缀使用
+    alias: str | None = Field(default=None, max_length=32)
     department_id: int
     engine: Cluster.Engine = Cluster.Engine.MYSQL
     env: Cluster.Env = Cluster.Env.DEV
@@ -72,6 +74,7 @@ class ClusterIn(Schema):
 
 class ClusterPatch(Schema):
     name: str | None = Field(default=None, max_length=100)
+    alias: str | None = Field(default=None, max_length=32)
     department_id: int | None = None
     engine: Cluster.Engine | None = None
     env: Cluster.Env | None = None
@@ -82,6 +85,7 @@ class ClusterPatch(Schema):
 class ClusterOut(Schema):
     id: int
     name: str
+    alias: str | None
     department_id: int
     department_name: str
     engine: str
@@ -106,6 +110,8 @@ class PagedClusterOut(Schema):
 
 class InstanceIn(Schema):
     name: str = Field(min_length=1, max_length=100)
+    # 实例别名在集群内唯一
+    alias: str | None = Field(default=None, max_length=32)
     cluster_id: int
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(ge=1, le=65535)
@@ -119,6 +125,7 @@ class InstanceIn(Schema):
 
 class InstancePatch(Schema):
     name: str | None = Field(default=None, max_length=100)
+    alias: str | None = Field(default=None, max_length=32)
     cluster_id: int | None = None
     host: str | None = Field(default=None, max_length=255)
     port: int | None = Field(default=None, ge=1, le=65535)
@@ -132,8 +139,10 @@ class InstancePatch(Schema):
 class InstanceOut(Schema):
     id: int
     name: str
+    alias: str | None
     cluster_id: int
     cluster_name: str
+    cluster_alias: str | None
     department_id: int
     host: str
     port: int

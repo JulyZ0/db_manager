@@ -9,6 +9,13 @@ from __future__ import annotations
 
 from django.db import models
 
+from apps.assets.validators import (
+    ALIAS_HELP_TEXT,
+    ALIAS_MAX_LENGTH,
+    normalize_alias,
+    validate_alias,
+)
+
 
 class TimeStampedModel(models.Model):
     """公共时间戳基类。"""
@@ -57,6 +64,16 @@ class Cluster(TimeStampedModel):
         PROD = "prod", "生产"
 
     name = models.CharField("集群名称", max_length=100)
+    # 集群别名全局唯一：控制台里可以只写一个词就切到某个集群
+    alias = models.CharField(
+        "集群别名",
+        max_length=ALIAS_MAX_LENGTH,
+        unique=True,
+        null=True,
+        blank=True,
+        validators=[validate_alias],
+        help_text=ALIAS_HELP_TEXT,
+    )
     department = models.ForeignKey(
         Department,
         on_delete=models.PROTECT,
@@ -89,6 +106,11 @@ class Cluster(TimeStampedModel):
     def __str__(self) -> str:
         return f"{self.department.name}/{self.name}"
 
+    def save(self, *args, **kwargs):
+        # 空串会互相冲突（NULL 不会），所以"没填别名"必须统一存 NULL
+        self.alias = normalize_alias(self.alias)
+        super().save(*args, **kwargs)
+
 
 class Instance(TimeStampedModel):
     """数据库实例：可连接的 host:port 端点。"""
@@ -104,6 +126,16 @@ class Instance(TimeStampedModel):
         OFFLINE = "offline", "离线"
 
     name = models.CharField("实例名称", max_length=100)
+    # 实例别名在**集群内**唯一：不同集群可以有同名实例，
+    # 因此控制台里跨集群切换要用「集群别名.实例别名」
+    alias = models.CharField(
+        "实例别名",
+        max_length=ALIAS_MAX_LENGTH,
+        null=True,
+        blank=True,
+        validators=[validate_alias],
+        help_text=ALIAS_HELP_TEXT,
+    )
     cluster = models.ForeignKey(
         Cluster,
         on_delete=models.PROTECT,
@@ -142,6 +174,11 @@ class Instance(TimeStampedModel):
         """
         return bool(self.password_ciphertext)
 
+    def save(self, *args, **kwargs):
+        # 集群内别名唯一；空串会互相冲突，统一存 NULL
+        self.alias = normalize_alias(self.alias)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "assets_instance"
         verbose_name = "实例"
@@ -151,6 +188,11 @@ class Instance(TimeStampedModel):
             models.UniqueConstraint(
                 fields=["cluster", "host", "port"],
                 name="uniq_instance_endpoint_per_cluster",
+            ),
+            # 集群内别名唯一；不同集群可以同名，所以跨集群切换要写「集群.实例」
+            models.UniqueConstraint(
+                fields=["cluster", "alias"],
+                name="uniq_instance_alias_per_cluster",
             ),
             models.CheckConstraint(
                 condition=models.Q(port__gte=1) & models.Q(port__lte=65535),

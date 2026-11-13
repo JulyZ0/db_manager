@@ -1,0 +1,459 @@
+{% extends "base.html" %}
+{% block title %}控制台 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<style>
+  /* 控制台专用样式就近放置，避免影响其它页面的浅色主题 */
+  .term-wrap {
+    background: #0b0f14;
+    border: 1px solid #1f2937;
+    border-radius: 8px;
+    padding: 0;
+    overflow: hidden;
+    font-family: "Cascadia Mono", "Consolas", "Courier New", monospace;
+  }
+  .term-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: #111827;
+    border-bottom: 1px solid #1f2937;
+    color: #9ca3af;
+    font-size: 12px;
+  }
+  .term-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .term-dot.r { background: #ef4444; }
+  .term-dot.y { background: #f59e0b; }
+  .term-dot.g { background: #22c55e; }
+  .term-title { margin-left: 8px; color: #6b7280; }
+
+  .term-body {
+    height: 60vh;
+    min-height: 360px;
+    overflow-y: auto;
+    padding: 12px 14px;
+    color: #d1d5db;
+    font-size: 13px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .term-line { margin: 0 0 2px; }
+  .term-ok { color: #4ade80; }
+  .term-err { color: #f87171; }
+  .term-warn { color: #fbbf24; }
+  .term-dim { color: #6b7280; }
+  .term-cmd { color: #60a5fa; }
+  .term-head { color: #a78bfa; }
+
+  .term-table { border-collapse: collapse; margin: 6px 0 10px; font-size: 12.5px; }
+  .term-table th, .term-table td {
+    border: 1px solid #1f2937;
+    padding: 3px 10px;
+    text-align: left;
+    white-space: nowrap;
+    color: #d1d5db;
+  }
+  .term-table th { background: #111827; color: #93c5fd; font-weight: normal; }
+
+  .term-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: #0f1620;
+    border-top: 1px solid #1f2937;
+  }
+  .term-prompt { color: #4ade80; white-space: nowrap; }
+  .term-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #e5e7eb;
+    font-family: inherit;
+    font-size: 13px;
+    caret-color: #4ade80;
+  }
+  .term-hint {
+    padding: 8px 14px;
+    background: #0f1620;
+    color: #4b5563;
+    font-size: 12px;
+    border-top: 1px solid #1f2937;
+    font-family: inherit;
+  }
+  .term-hint code { color: #9ca3af; }
+</style>
+
+<div class="page-head">
+  <div>
+    <h1>控制台</h1>
+    <div class="sub">
+      直接对已登记的数据库执行语句。输入 <code>help</code> 查看命令。
+    </div>
+  </div>
+</div>
+
+<div class="term-wrap">
+  <div class="term-bar">
+    <span class="term-dot r"></span>
+    <span class="term-dot y"></span>
+    <span class="term-dot g"></span>
+    <span class="term-title" id="term-title">db-manager — 未选择实例</span>
+  </div>
+
+  <div class="term-body" id="term-body"></div>
+
+  <div class="term-input-row">
+    <span class="term-prompt" id="term-prompt">db&gt;</span>
+    <input class="term-input" id="term-input" autocomplete="off" spellcheck="false"
+           placeholder="输入命令，回车执行">
+  </div>
+
+  <div class="term-hint">
+    <code>help</code> 帮助 · <code>list</code> 实例列表 · <code>sw &lt;目标&gt;</code> 切换实例 ·
+    <code>verify</code> 验证凭据 · 其余输入按 SQL 执行
+  </div>
+</div>
+
+{# 用于确保 CSRF cookie 已下发；执行语句时从 cookie 读取 #}
+<div style="display:none">{% csrf_token %}</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var body = document.getElementById("term-body");
+  var input = document.getElementById("term-input");
+  var promptEl = document.getElementById("term-prompt");
+  var titleEl = document.getElementById("term-title");
+
+  var current = null;        // 当前选中的实例
+  var busy = false;
+  var history = [];
+  var histIdx = -1;
+  var pendingConfirm = null; // 已提示需确认的破坏性语句
+
+  function csrfToken() {
+    var m = document.cookie.match(/(^|;\s*)csrftoken=([^;]+)/);
+    return m ? decodeURIComponent(m[2]) : "";
+  }
+
+  function esc(text) {
+    return String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function write(html, cls) {
+    var div = document.createElement("div");
+    div.className = "term-line " + (cls || "");
+    div.innerHTML = html;
+    body.appendChild(div);
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function writeText(text, cls) {
+    write(esc(text), cls);
+  }
+
+  function echo(cmd) {
+    var p = current ? "[" + current.id + "] db&gt;" : "db&gt;";
+    write('<span class="term-prompt">' + p + "</span> " +
+          '<span class="term-cmd">' + esc(cmd) + "</span>");
+  }
+
+  function updatePrompt() {
+    promptEl.textContent = current ? "[" + current.id + "] db>" : "db>";
+    titleEl.textContent = current
+      ? "db-manager — " + current.label + " (" + current.endpoint + ")"
+      : "db-manager — 未选择实例";
+  }
+
+  function renderTable(columns, rows) {
+    if (!columns || !columns.length) return;
+    var html = '<table class="term-table"><thead><tr>';
+    columns.forEach(function (c) { html += "<th>" + esc(c) + "</th>"; });
+    html += "</tr></thead><tbody>";
+    rows.forEach(function (r) {
+      html += "<tr>";
+      r.forEach(function (v) { html += "<td>" + esc(v) + "</td>"; });
+      html += "</tr>";
+    });
+    html += "</tbody></table>";
+    write(html);
+  }
+
+  // ---- 命令实现 ----------------------------------------------------------
+
+  var HELP = [
+    "可用命令：",
+    "  help                    显示本帮助",
+    "  list                    列出所有实例（含 id 与别名）",
+    "  sw <目标>               切换要操作的实例，写法见下",
+    "  status                  查看当前实例",
+    "  verify                  连一次目标库，验证账号密码是否可用",
+    "  clear                   清屏",
+    "  其它输入                按 SQL 发送到当前实例执行",
+    "",
+    "sw 的写法：",
+    "  sw 3                    按实例 id",
+    "  sw jq1.ins1             集群别名 . 实例别名",
+    "  sw 1.1                  集群 id . 实例 id",
+    "  sw jq1@10.0.12.1        集群别名 @ 主机（多端口时加 :3306）",
+    "  sw jq1                  集群下只有一个实例时，直接选中",
+    "",
+    "提示：执行 DROP / TRUNCATE 会要求二次确认，再次输入同一条语句即可。"
+  ].join("\n");
+
+  function cmdHelp() {
+    writeText(HELP);
+  }
+
+  function cmdList() {
+    return fetch("/console/instances.json", { headers: { "X-Requested-With": "XMLHttpRequest" } })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.results.length) {
+          writeText("还没有登记任何实例。请先到「实例管理」新增。", "term-warn");
+          return;
+        }
+        writeText("共 " + data.count + " 个实例：", "term-dim");
+        renderTable(
+          ["id", "名称", "别名", "引擎", "环境", "地址", "账号", "密码", "状态"],
+          data.results.map(function (i) {
+            // 别名列显示「集群别名.实例别名」，可直接喂给 sw
+            var alias = "";
+            if (i.cluster_alias) alias += i.cluster_alias;
+            if (i.alias) alias += (alias ? "." : "") + i.alias;
+            return [
+              String(i.id), i.label, alias || "-", i.engine, i.env, i.endpoint,
+              i.username,
+              i.password_set ? "已设置" : "未设置",
+              (i.is_active ? "" : "已停用 ") + i.status
+            ];
+          })
+        );
+      })
+      .catch(function () { writeText("获取实例列表失败", "term-err"); });
+  }
+
+  // sw：切换目标实例。
+  // 解析规则在服务端（apps.assets.resolver），前端只负责把输入原样递过去，
+  // 于是 CLI 与页面共享同一套语义，不会出现两边行为不一致。
+  function cmdSw(arg) {
+    if (!arg) {
+      writeText("用法：sw <目标>。可写实例 id、集群.实例、集群@主机；help 查看全部写法", "term-warn");
+      return Promise.resolve();
+    }
+    return fetch("/console/switch.json?target=" + encodeURIComponent(arg),
+                 { headers: { "X-Requested-With": "XMLHttpRequest" } })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) {
+          writeText(d.message || "切换失败", "term-err");
+          if (d.candidates && d.candidates.length) {
+            writeText("候选：", "term-dim");
+            renderTable(
+              ["id", "名称", "地址", "别名"],
+              d.candidates.map(function (c) {
+                var alias = c.cluster_alias ? c.cluster_alias + "." : "";
+                return [String(c.id), c.label, c.endpoint, alias + (c.alias || "")]
+              })
+            );
+            if (d.candidate_count > d.candidates.length) {
+              writeText("（只显示前 " + d.candidates.length + " 个，共 " + d.candidate_count + " 个）", "term-dim");
+            }
+          }
+          return;
+        }
+        current = d.instance;
+        updatePrompt();
+        writeText("已切换：" + current.label + " (" + current.endpoint + ")", "term-ok");
+        if (!current.password_set) {
+          writeText("注意：该实例尚未登记密码，执行语句会失败。", "term-warn");
+        }
+      })
+      .catch(function () { writeText("切换请求失败：无法连接到服务", "term-err"); });
+  }
+
+  function cmdStatus() {
+    if (!current) {
+      writeText("尚未选择实例，先执行 sw <目标>", "term-warn");
+      return;
+    }
+    renderTable(
+      ["字段", "值"],
+      [
+        ["实例", current.label],
+        ["引擎", current.engine],
+        ["环境", current.env],
+        ["地址", current.endpoint],
+        ["账号", current.username],
+        ["密码", current.password_set ? "已设置" : "未设置"],
+        ["状态", (current.is_active ? "" : "已停用 ") + current.status]
+      ]
+    );
+  }
+
+  function cmdVerify() {
+    if (!current) {
+      writeText("尚未选择实例，先执行 sw <目标>", "term-warn");
+      return Promise.resolve();
+    }
+    writeText("正在连接 " + current.endpoint + " …", "term-dim");
+    return fetch("/console/" + current.id + "/verify.json",
+                 { headers: { "X-Requested-With": "XMLHttpRequest" } })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.ok) {
+          writeText("凭据可用（" + (d.latency_ms == null ? "-" : d.latency_ms + "ms") +
+                    "，版本 " + (d.server_version || "未知") + "）", "term-ok");
+        } else {
+          writeText("连接失败：" + (d.hint || d.error || "未知原因"), "term-err");
+        }
+      });
+  }
+
+  function cmdClear() {
+    body.innerHTML = "";
+    updatePrompt();
+  }
+
+  function runSql(sql, confirmed) {
+    if (!current) {
+      writeText("尚未选择实例。先执行 sw <目标> 选择目标库。", "term-warn");
+      return Promise.resolve();
+    }
+    busy = true;
+    var form = new URLSearchParams();
+    form.set("sql", sql);
+    if (confirmed) form.set("confirm", "1");
+
+    return fetch("/console/" + current.id + "/exec/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "X-CSRFToken": csrfToken(),
+        "X-Requested-With": "XMLHttpRequest"
+      },
+      body: form.toString(),
+      credentials: "same-origin"
+    })
+      .then(function (resp) {
+        // 未登录时 login_required_page 会 302 到登录页，fetch 会跟随到 HTML
+        var ct = resp.headers.get("Content-Type") || "";
+        if (ct.indexOf("application/json") === -1) {
+          throw new Error("NOT_JSON");
+        }
+        return resp.json();
+      })
+      .then(function (d) {
+        if (d.error === "confirm_required") {
+          pendingConfirm = sql;
+          writeText("该语句不可逆（DROP / TRUNCATE）。确认请再次输入同一条语句。", "term-warn");
+          return;
+        }
+        if (!d.ok) {
+          writeText("失败：" + (d.hint || d.error || "未知错误"), "term-err");
+          return;
+        }
+        if (d.columns && d.columns.length) {
+          renderTable(d.columns, d.rows);
+          var summary = "返回 " + d.row_count + " 行";
+          if (d.truncated) summary += "（已截断，仅显示前 " + d.row_count + " 行）";
+          summary += "，耗时 " + d.duration_ms + "ms";
+          writeText(summary, "term-dim");
+        } else {
+          writeText("执行成功，影响 " + (d.affected == null ? "-" : d.affected) +
+                    " 行，耗时 " + d.duration_ms + "ms", "term-ok");
+        }
+      })
+      .catch(function (err) {
+        if (err && err.message === "NOT_JSON") {
+          writeText("需要登录才能执行语句。请先在浏览器打开 /admin/ 登录，然后刷新本页。",
+                    "term-err");
+        } else {
+          writeText("请求失败：无法连接到服务", "term-err");
+        }
+      })
+      .finally(function () { busy = false; });
+  }
+
+  // ---- 分发 --------------------------------------------------------------
+
+  var pendingConfirm = null;
+
+  function dispatch(line) {
+    var text = line.trim();
+    if (!text) return Promise.resolve();
+
+    echo(text);
+    var parts = text.split(/\s+/);
+    var cmd = parts[0].toLowerCase();
+
+    if (cmd === "help" || cmd === "?") return Promise.resolve(cmdHelp());
+    if (cmd === "clear" || cmd === "cls") return Promise.resolve(cmdClear());
+    if (cmd === "list" || cmd === "ls") return cmdList();
+    if (cmd === "sw") return cmdSw(parts[1]);
+    if (cmd === "status") return Promise.resolve(cmdStatus());
+    if (cmd === "verify") return cmdVerify();
+    if (cmd === "exit" || cmd === "quit") {
+      writeText("关闭标签页即可退出。", "term-dim");
+      return Promise.resolve();
+    }
+
+    // 二次确认：同一条破坏性语句再输一次即视为确认
+    if (pendingConfirm !== null && text === pendingConfirm) {
+      var sqlToRun = pendingConfirm;
+      pendingConfirm = null;
+      return runSql(sqlToRun, true);
+    }
+    pendingConfirm = null;
+    return runSql(text, false);
+  }
+
+  // ---- 事件 --------------------------------------------------------------
+
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      if (busy) return;
+      var line = input.value;
+      input.value = "";
+      if (line.trim()) {
+        history.push(line);
+        histIdx = history.length;
+      }
+      dispatch(line);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!history.length) return;
+      histIdx = Math.max(0, histIdx - 1);
+      input.value = history[histIdx] || "";
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (!history.length) return;
+      histIdx = Math.min(history.length, histIdx + 1);
+      input.value = history[histIdx] || "";
+    } else if (e.key === "l" && e.ctrlKey) {
+      e.preventDefault();
+      cmdClear();
+    }
+  });
+
+  // 点击空白处聚焦输入框，符合终端使用习惯
+  document.querySelector(".term-wrap").addEventListener("click", function (e) {
+    if (e.target.tagName !== "INPUT") input.focus();
+  });
+
+  writeText("数据库实例管理控制台", "term-head");
+  writeText("输入 help 查看可用命令；先 list 看实例，再用 sw 选中目标库。", "term-dim");
+  writeText("");
+  updatePrompt();
+  input.focus();
+})();
+</script>
+{% endblock %}

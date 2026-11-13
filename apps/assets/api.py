@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Count, Q
 from django.http import HttpRequest
 from django.utils import timezone
@@ -31,6 +32,7 @@ from apps.assets.schemas import (
     PagedDepartmentOut,
     PagedInstanceOut,
 )
+from common.auth import django_session_auth
 from common.exceptions import ConflictError, NotFoundError
 from common.pagination import paginate_queryset
 
@@ -61,6 +63,7 @@ def _cluster_out(obj: Cluster) -> ClusterOut:
     return ClusterOut(
         id=obj.id,
         name=obj.name,
+        alias=obj.alias,
         department_id=obj.department_id,
         department_name=obj.department.name,
         engine=obj.engine,
@@ -77,8 +80,10 @@ def _instance_out(obj: Instance) -> InstanceOut:
     return InstanceOut(
         id=obj.id,
         name=obj.name,
+        alias=obj.alias,
         cluster_id=obj.cluster_id,
         cluster_name=obj.cluster.name,
+        cluster_alias=obj.cluster.alias,
         department_id=obj.cluster.department_id,
         host=obj.host,
         port=obj.port,
@@ -122,8 +127,52 @@ def _get_instance(instance_id: int) -> Instance:
     return obj
 
 
-# ---------------------------------------------------------------------------
-# 部门 /api/v1/departments
+def _clean_alias(raw: str | None) -> str | None:
+    """校验别名格式并归一化。
+
+    规则与模型层一致（``apps.assets.validators``），这里提前做一次是为了
+    返回 422 的业务错误体，而不是让数据库约束抛 IntegrityError（500）。
+    """
+    from apps.assets.validators import normalize_alias, validate_alias
+
+    alias = normalize_alias(raw)
+    if alias is None:
+        return None
+    try:
+        validate_alias(alias)
+    except DjangoValidationError as exc:
+        raise ConflictError(
+            str(exc.messages[0]), detail={"field": "alias"}
+        ) from exc
+    return alias
+
+
+def _assert_cluster_alias_free(alias: str | None, exclude_id: int | None = None) -> None:
+    """集群别名全局唯一。"""
+    if alias is None:
+        return
+    qs = Cluster.objects.filter(alias__iexact=alias)
+    if exclude_id is not None:
+        qs = qs.exclude(id=exclude_id)
+    if qs.exists():
+        raise ConflictError(f"集群别名「{alias}」已被占用", detail={"field": "alias"})
+
+
+def _assert_instance_alias_free(
+    cluster_id: int, alias: str | None, exclude_id: int | None = None
+) -> None:
+    """实例别名在集群内唯一。"""
+    if alias is None:
+        return
+    qs = Instance.objects.filter(cluster_id=cluster_id, alias__iexact=alias)
+    if exclude_id is not None:
+        qs = qs.exclude(id=exclude_id)
+    if qs.exists():
+        raise ConflictError(
+            f"该集群内已存在实例别名「{alias}」", detail={"field": "alias"}
+        )
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -152,7 +201,9 @@ def list_departments(
     )
 
 
-@departments_router.post("", response={201: DepartmentOut}, summary="新建部门")
+@departments_router.post(
+    "", response={201: DepartmentOut}, summary="新建部门", auth=django_session_auth
+)
 def create_department(request: HttpRequest, payload: DepartmentIn):
     if Department.objects.filter(name=payload.name).exists():
         raise ConflictError(f"部门名称「{payload.name}」已存在", detail={"field": "name"})
@@ -176,7 +227,12 @@ def get_department(request: HttpRequest, department_id: int):
     return _department_out(obj)
 
 
-@departments_router.patch("/{department_id}", response=DepartmentOut, summary="更新部门")
+@departments_router.patch(
+    "/{department_id}",
+    response=DepartmentOut,
+    summary="更新部门",
+    auth=django_session_auth,
+)
 def update_department(
     request: HttpRequest, department_id: int, payload: DepartmentPatch
 ):
@@ -201,7 +257,12 @@ def update_department(
     return _department_out(obj)
 
 
-@departments_router.delete("/{department_id}", response={204: None}, summary="删除部门")
+@departments_router.delete(
+    "/{department_id}",
+    response={204: None},
+    summary="删除部门",
+    auth=django_session_auth,
+)
 def delete_department(request: HttpRequest, department_id: int):
     obj = _get_department(department_id)
     cluster_count = obj.clusters.count()
@@ -252,7 +313,9 @@ def list_clusters(
     )
 
 
-@clusters_router.post("", response={201: ClusterOut}, summary="新建集群")
+@clusters_router.post(
+    "", response={201: ClusterOut}, summary="新建集群", auth=django_session_auth
+)
 def create_cluster(request: HttpRequest, payload: ClusterIn):
     department = Department.objects.filter(id=payload.department_id).first()
     if department is None:
@@ -266,8 +329,12 @@ def create_cluster(request: HttpRequest, payload: ClusterIn):
             detail={"field": "name", "department_id": payload.department_id},
         )
 
+    alias = _clean_alias(payload.alias)
+    _assert_cluster_alias_free(alias)
+
     obj = Cluster.objects.create(
         name=payload.name,
+        alias=alias,
         department=department,
         engine=payload.engine,
         env=payload.env,
@@ -285,7 +352,9 @@ def get_cluster(request: HttpRequest, cluster_id: int):
     return _cluster_out(obj)
 
 
-@clusters_router.patch("/{cluster_id}", response=ClusterOut, summary="更新集群")
+@clusters_router.patch(
+    "/{cluster_id}", response=ClusterOut, summary="更新集群", auth=django_session_auth
+)
 def update_cluster(request: HttpRequest, cluster_id: int, payload: ClusterPatch):
     obj = _get_cluster(cluster_id)
     data = payload.model_dump(exclude_unset=True)
@@ -305,6 +374,10 @@ def update_cluster(request: HttpRequest, cluster_id: int, payload: ClusterPatch)
             f"该部门下已存在集群「{target_name}」", detail={"field": "name"}
         )
 
+    if "alias" in data:
+        data["alias"] = _clean_alias(data["alias"])
+        _assert_cluster_alias_free(data["alias"], exclude_id=obj.id)
+
     for field, value in data.items():
         setattr(obj, field, value)
     obj.save()
@@ -313,7 +386,9 @@ def update_cluster(request: HttpRequest, cluster_id: int, payload: ClusterPatch)
     return _cluster_out(obj)
 
 
-@clusters_router.delete("/{cluster_id}", response={204: None}, summary="删除集群")
+@clusters_router.delete(
+    "/{cluster_id}", response={204: None}, summary="删除集群", auth=django_session_auth
+)
 def delete_cluster(request: HttpRequest, cluster_id: int):
     obj = _get_cluster(cluster_id)
     instance_count = obj.instances.count()
@@ -365,7 +440,9 @@ def list_instances(
     )
 
 
-@instances_router.post("", response={201: InstanceOut}, summary="新建实例")
+@instances_router.post(
+    "", response={201: InstanceOut}, summary="新建实例", auth=django_session_auth
+)
 def create_instance(request: HttpRequest, payload: InstanceIn):
     cluster = Cluster.objects.select_related("department").filter(
         id=payload.cluster_id
@@ -381,6 +458,9 @@ def create_instance(request: HttpRequest, payload: InstanceIn):
             detail={"field": "host_port"},
         )
 
+    alias = _clean_alias(payload.alias)
+    _assert_instance_alias_free(payload.cluster_id, alias)
+
     ciphertext = ""
     version = 0
     updated_at = None
@@ -393,6 +473,7 @@ def create_instance(request: HttpRequest, payload: InstanceIn):
 
     obj = Instance.objects.create(
         name=payload.name,
+        alias=alias,
         cluster=cluster,
         host=payload.host,
         port=payload.port,
@@ -412,7 +493,9 @@ def get_instance(request: HttpRequest, instance_id: int):
     return _instance_out(_get_instance(instance_id))
 
 
-@instances_router.patch("/{instance_id}", response=InstanceOut, summary="更新实例")
+@instances_router.patch(
+    "/{instance_id}", response=InstanceOut, summary="更新实例", auth=django_session_auth
+)
 def update_instance(request: HttpRequest, instance_id: int, payload: InstancePatch):
     obj = _get_instance(instance_id)
     data = payload.model_dump(exclude_unset=True)
@@ -440,6 +523,12 @@ def update_instance(request: HttpRequest, instance_id: int, payload: InstancePat
             detail={"field": "host_port"},
         )
 
+    if "alias" in data:
+        data["alias"] = _clean_alias(data["alias"])
+        _assert_instance_alias_free(
+            target_cluster_id, data["alias"], exclude_id=obj.id
+        )
+
     data.pop("cluster_id", None)
     for field, value in data.items():
         setattr(obj, field, value)
@@ -456,7 +545,12 @@ def update_instance(request: HttpRequest, instance_id: int, payload: InstancePat
     return _instance_out(obj)
 
 
-@instances_router.delete("/{instance_id}", response={204: None}, summary="删除实例")
+@instances_router.delete(
+    "/{instance_id}",
+    response={204: None},
+    summary="删除实例",
+    auth=django_session_auth,
+)
 def delete_instance(request: HttpRequest, instance_id: int):
     obj = _get_instance(instance_id)
     # 轮换历史通过 FK on_delete=CASCADE 自动清理

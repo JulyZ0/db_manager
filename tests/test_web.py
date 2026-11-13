@@ -177,6 +177,78 @@ class TestFormRoundTrip:
         assert obj.password_set is False
         assert obj.password_version == 0
 
+    def test_create_cluster_with_alias(self, api_client, seeded):
+        resp = api_client.post(
+            "/clusters/new/",
+            data={
+                "name": "cache-redis",
+                "alias": "jq1",
+                "department": seeded["dept"].id,
+                "engine": Cluster.Engine.REDIS,
+                "env": Cluster.Env.DEV,
+                "is_active": "on",
+            },
+        )
+        assert resp.status_code == 302
+        assert Cluster.objects.get(name="cache-redis").alias == "jq1"
+
+    def test_cluster_alias_must_not_be_all_digits(self, api_client, seeded):
+        resp = api_client.post(
+            "/clusters/new/",
+            data={
+                "name": "bad-alias",
+                "alias": "123",
+                "department": seeded["dept"].id,
+                "engine": Cluster.Engine.MYSQL,
+                "env": Cluster.Env.DEV,
+                "is_active": "on",
+            },
+        )
+        assert resp.status_code == 200, "别名非法应重新渲染表单"
+        assert not Cluster.objects.filter(name="bad-alias").exists()
+
+    def test_cluster_alias_rejects_special_chars(self, api_client, seeded):
+        for bad in ("jq 1", "jq@1", "jq.1", "jq;1"):
+            resp = api_client.post(
+                "/clusters/new/",
+                data={
+                    "name": f"c-{bad}",
+                    "alias": bad,
+                    "department": seeded["dept"].id,
+                    "engine": Cluster.Engine.MYSQL,
+                    "env": Cluster.Env.DEV,
+                    "is_active": "on",
+                },
+            )
+            assert resp.status_code == 200, bad
+
+    def test_instance_alias_shown_on_detail(self, api_client, seeded):
+        instance = seeded["instance"]
+        instance.alias = "ins1"
+        instance.save(update_fields=["alias"])
+
+        resp = api_client.get(f"/instances/{instance.id}/")
+        assert resp.status_code == 200
+        assert "ins1" in resp.content.decode()
+
+    def test_create_instance_with_alias(self, api_client, seeded):
+        resp = api_client.post(
+            "/instances/new/",
+            data={
+                "name": "core-03",
+                "alias": "ins9",
+                "cluster": seeded["cluster"].id,
+                "host": "10.0.0.3",
+                "port": 3308,
+                "role": Instance.Role.MASTER,
+                "username": "app",
+                "remark": "",
+                "is_active": "on",
+            },
+        )
+        assert resp.status_code == 302
+        assert Instance.objects.get(name="core-03").alias == "ins9"
+
     def test_instance_port_out_of_range_shows_error(self, api_client, seeded):
         resp = api_client.post(
             "/instances/new/",
@@ -323,3 +395,342 @@ class TestNoSecretLeak:
         ]:
             body = api_client.get(path).content.decode()
             assert "THIS_IS_SECRET" not in body, path
+
+
+# ---------------------------------------------------------------------------
+# 详情页凭据验证（异步自动执行）
+# ---------------------------------------------------------------------------
+
+
+def test_detail_page_has_async_verify_hook(api_client, seeded):
+    """详情页要自带验证端点地址，页面打开即触发，不需要用户点按钮。"""
+    resp = api_client.get(f"/instances/{seeded['instance'].id}/")
+
+    assert resp.status_code == 200
+    body = resp.content.decode()
+    assert f"/instances/{seeded['instance'].id}/verify-credentials/" in body
+
+
+def test_verify_endpoint_returns_ok(api_client, seeded, monkeypatch):
+    from apps.dbconsole import services
+
+    def fake(instance, timeout=None):
+        return services.ConnectionInfo(
+            ok=True,
+            engine="mysql",
+            latency_ms=12,
+            server_version="8.0.36",
+        )
+
+    monkeypatch.setattr("apps.dbconsole.services.verify_credentials", fake)
+    resp = api_client.get(
+        f"/instances/{seeded['instance'].id}/verify-credentials/"
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["latency_ms"] == 12
+    assert data["server_version"] == "8.0.36"
+
+
+def test_verify_endpoint_reports_auth_failure_without_500(
+    api_client, seeded, monkeypatch
+):
+    """密码错是业务结论，HTTP 仍应为 200，前端据 ok 字段渲染。"""
+    from apps.dbconsole import services
+
+    def fake(instance, timeout=None):
+        return services.ConnectionInfo(
+            ok=False,
+            engine="mysql",
+            error=services.ERROR_AUTH_FAILED,
+            message="账号或密码不正确",
+        )
+
+    monkeypatch.setattr("apps.dbconsole.services.verify_credentials", fake)
+    resp = api_client.get(
+        f"/instances/{seeded['instance'].id}/verify-credentials/"
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["error"] == "auth_failed"
+    assert data["hint"] == "账号或密码不正确"
+
+
+def test_verify_endpoint_does_not_persist_anything(api_client, seeded, monkeypatch):
+    """验证结果不落库：字段值必须原样，避免陈旧结论误导运维。"""
+    from apps.assets.models import Instance
+
+    before = Instance.objects.get(id=seeded["instance"].id)
+    snapshot = (
+        before.status,
+        before.last_probe_ok,
+        before.last_probed_at,
+        before.updated_at,
+    )
+
+    from apps.dbconsole import services
+
+    monkeypatch.setattr(
+        "apps.dbconsole.services.verify_credentials",
+        lambda instance, timeout=None: services.ConnectionInfo(
+            ok=True, engine="mysql", latency_ms=5
+        ),
+    )
+    api_client.get(f"/instances/{seeded['instance'].id}/verify-credentials/")
+
+    after = Instance.objects.get(id=seeded["instance"].id)
+    assert (
+        after.status,
+        after.last_probe_ok,
+        after.last_probed_at,
+        after.updated_at,
+    ) == snapshot
+
+
+def test_verify_endpoint_404_for_missing_instance(api_client):
+    resp = api_client.get("/instances/999999/verify-credentials/")
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 终端风格控制台
+# ---------------------------------------------------------------------------
+
+
+def test_console_page_renders(api_client, seeded):
+    """控制台页面可渲染，且带有终端骨架与命令提示。"""
+    resp = api_client.get("/console/")
+
+    assert resp.status_code == 200
+    body = resp.content.decode()
+    assert 'id="term-body"' in body
+    assert 'id="term-input"' in body
+    assert "help" in body
+    # 页面自带终端配色，不依赖外部样式表
+    assert "#0b0f14" in body
+
+
+def test_console_page_is_browsable_anonymously(anon_client):
+    """渲染空壳不需要登录；危险操作在执行端点单独守卫。"""
+    assert anon_client.get("/console/").status_code == 200
+
+
+def test_console_instances_lists_all(anon_client, seeded):
+    resp = anon_client.get("/console/instances.json")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["count"] == 1
+    item = data["results"][0]
+    assert item["endpoint"] == "10.0.0.1:3306"
+    assert item["label"] == "基础架构部/core-mysql-prod/core-01"
+    assert item["engine"] == "mysql"
+    assert item["env"] == "生产"
+    # 只暴露"有没有密码"，不暴露内容
+    assert item["password_set"] is False
+    assert "password" not in item
+
+
+def test_console_switch_by_instance_id(anon_client, seeded):
+    """sw 支持按实例 id 切换（原 use <id> 的能力必须保留）。"""
+    resp = anon_client.get(f"/console/switch.json?target={seeded['instance'].id}")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["instance"]["id"] == seeded["instance"].id
+    assert data["instance"]["endpoint"] == "10.0.0.1:3306"
+
+
+def test_console_switch_by_cluster_and_instance_alias(anon_client, seeded):
+    cluster = seeded["cluster"]
+    instance = seeded["instance"]
+    cluster.alias = "jq1"
+    cluster.save(update_fields=["alias"])
+    instance.alias = "ins1"
+    instance.save(update_fields=["alias"])
+
+    resp = anon_client.get("/console/switch.json?target=jq1.ins1")
+
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["instance"]["id"] == instance.id
+    assert data["instance"]["alias"] == "ins1"
+    assert data["instance"]["cluster_alias"] == "jq1"
+
+
+def test_console_switch_by_numeric_path(anon_client, seeded):
+    """集群 id . 实例 id 也能用。"""
+    target = f"{seeded['cluster'].id}.{seeded['instance'].id}"
+    data = anon_client.get(f"/console/switch.json?target={target}").json()
+
+    assert data["ok"] is True
+    assert data["instance"]["id"] == seeded["instance"].id
+
+
+def test_console_switch_by_cluster_at_host(anon_client, seeded):
+    cluster = seeded["cluster"]
+    cluster.alias = "jq1"
+    cluster.save(update_fields=["alias"])
+
+    data = anon_client.get("/console/switch.json?target=jq1@10.0.0.1").json()
+
+    assert data["ok"] is True
+    assert data["instance"]["id"] == seeded["instance"].id
+
+
+def test_console_switch_reports_missing_target(anon_client, seeded):
+    data = anon_client.get("/console/switch.json?target=nosuch").json()
+
+    assert data["ok"] is False
+    assert data["error"] == "not_found"
+    assert "message" in data
+
+
+def test_console_switch_reports_ambiguity_with_candidates(anon_client, seeded):
+    """同主机多端口时必须报歧义并给出候选，不能随便挑一个。"""
+    Instance.objects.create(
+        name="core-02",
+        cluster=seeded["cluster"],
+        host="10.0.0.1",
+        port=3307,
+        username="app",
+    )
+    seeded["cluster"].alias = "jq1"
+    seeded["cluster"].save(update_fields=["alias"])
+
+    data = anon_client.get("/console/switch.json?target=jq1@10.0.0.1").json()
+
+    assert data["ok"] is False
+    assert data["error"] == "ambiguous"
+    assert data["candidate_count"] == 2
+    assert {c["endpoint"] for c in data["candidates"]} == {
+        "10.0.0.1:3306",
+        "10.0.0.1:3307",
+    }
+
+
+def test_console_switch_never_leaks_password(anon_client, seeded):
+    """切换回包同样不得带出任何凭据内容。"""
+    seeded["instance"].password_ciphertext = "v1:TOPSECRET"
+    seeded["instance"].save(update_fields=["password_ciphertext"])
+
+    body = anon_client.get(
+        f"/console/switch.json?target={seeded['instance'].id}"
+    ).content.decode()
+
+    assert "TOPSECRET" not in body
+    assert "password_ciphertext" not in body
+
+
+def test_console_help_mentions_sw_not_use(api_client, seeded):
+    """控制台帮助里应当只讲 sw；use 已被移除以免与 SQL 的 USE 冲突。"""
+    body = api_client.get("/console/").content.decode()
+
+    assert "sw <目标>" in body
+    assert "use <id>" not in body
+
+
+def test_console_verify_reports_no_password(anon_client, seeded):
+    resp = anon_client.get(f"/console/{seeded['instance'].id}/verify.json")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["error"] == "no_password"
+
+
+def test_console_exec_requires_login(anon_client, seeded):
+    resp = anon_client.post(
+        f"/console/{seeded['instance'].id}/exec/", {"sql": "SELECT 1"}
+    )
+
+    # 未登录时被 login_required_page 拦到登录页，不会执行
+    assert resp.status_code == 302
+    assert "/admin/login/" in resp["Location"]
+
+
+def test_console_exec_rejects_empty_sql(api_client, seeded):
+    resp = api_client.post(f"/console/{seeded['instance'].id}/exec/", {"sql": "  "})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["error"] == "empty"
+
+
+def test_console_exec_blocks_multi_statement(api_client, seeded, monkeypatch):
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("多语句必须在执行前被拦下")
+
+    monkeypatch.setattr("apps.web.views.execute_statement", should_not_run, raising=False)
+    monkeypatch.setattr(
+        "apps.dbconsole.services.execute_statement", should_not_run, raising=False
+    )
+
+    resp = api_client.post(
+        f"/console/{seeded['instance'].id}/exec/", {"sql": "SELECT 1; DROP TABLE t"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["error"] == "multi_statement"
+
+
+def test_console_exec_requires_confirm_for_destructive(api_client, seeded, monkeypatch):
+    called = {"n": 0}
+
+    def fake_exec(*args, **kwargs):
+        called["n"] += 1
+        return __import__(
+            "apps.dbconsole.services", fromlist=["QueryResult"]
+        ).QueryResult(ok=True, affected=0, duration_ms=1)
+
+    monkeypatch.setattr("apps.dbconsole.services.execute_statement", fake_exec)
+
+    resp = api_client.post(
+        f"/console/{seeded['instance'].id}/exec/", {"sql": "TRUNCATE TABLE t"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["error"] == "confirm_required"
+    assert called["n"] == 0
+
+
+def test_console_exec_runs_select(api_client, seeded, monkeypatch):
+    from apps.dbconsole import services
+
+    monkeypatch.setattr(
+        "apps.dbconsole.services.execute_statement",
+        lambda *a, **kw: services.QueryResult(
+            ok=True, columns=["n"], rows=[["1"]], row_count=1, duration_ms=4
+        ),
+    )
+
+    resp = api_client.post(f"/console/{seeded['instance'].id}/exec/", {"sql": "SELECT 1"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["kind"] == "query"
+    assert data["rows"] == [["1"]]
+    assert data["duration_ms"] == 4
+
+
+def test_console_exec_passes_username_to_audit(api_client, seeded, monkeypatch):
+    from apps.dbconsole import services
+
+    captured = {}
+
+    def fake_exec(instance, statement, timeout=None, *, user_label=""):
+        captured["user"] = user_label
+        return services.QueryResult(ok=True, columns=["a"], rows=[["1"]], row_count=1)
+
+    monkeypatch.setattr("apps.dbconsole.services.execute_statement", fake_exec)
+
+    api_client.post(f"/console/{seeded['instance'].id}/exec/", {"sql": "SELECT 1"})
+
+    assert captured["user"] == "tester"

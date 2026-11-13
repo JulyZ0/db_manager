@@ -16,6 +16,7 @@ from ninja import Router, Schema
 
 from apps.assets.models import Instance
 from apps.probing.services import probe_tcp
+from common.auth import django_session_auth
 from common.exceptions import NotFoundError
 
 router = Router(tags=["探测"])
@@ -36,6 +37,7 @@ class ProbeOut(Schema):
     "/{instance_id}/probe",
     response=ProbeOut,
     summary="探测实例 TCP 端口是否可达",
+    auth=django_session_auth,
 )
 def probe_instance(request: HttpRequest, instance_id: int):
     instance = Instance.objects.filter(id=instance_id).first()

@@ -9,6 +9,7 @@ from ninja import Query, Router, Schema
 
 from apps.metrics.models import DailyInstanceStat
 from apps.metrics.services import aggregate_for_date
+from common.auth import django_session_auth
 
 router = Router(tags=["统计"])
 
@@ -66,7 +67,12 @@ def get_daily_stats(
     )
 
 
-@router.post("/daily/rebuild", response=RebuildOut, summary="按日期重算统计（幂等）")
+@router.post(
+    "/daily/rebuild",
+    response=RebuildOut,
+    summary="按日期重算统计（幂等）",
+    auth=django_session_auth,
+)
 def rebuild_daily_stats(request: HttpRequest, stat_date: date = Query(...)):
     rows_written = aggregate_for_date(stat_date)
     return RebuildOut(stat_date=stat_date, rows_written=rows_written)

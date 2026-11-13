@@ -34,6 +34,17 @@ class NotFoundError(BusinessError):
     code = "NOT_FOUND"
 
 
+class ValidationFailedError(BusinessError):
+    """业务层校验失败（区别于 Pydantic 的 Schema 校验）。
+
+    Schema 管的是"字段类型对不对"，这里管的是"值本身能不能用"，
+    例如语句为空、语句超长、一次提交了多条语句。
+    """
+
+    status_code = 422
+    code = "VALIDATION_ERROR"
+
+
 class ConflictError(BusinessError):
     """名称重复、存在子资源、任务并发冲突等。"""
 

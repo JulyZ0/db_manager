@@ -58,9 +58,10 @@ class DepartmentForm(BootstrapMixin, forms.ModelForm):
 class ClusterForm(BootstrapMixin, forms.ModelForm):
     class Meta:
         model = Cluster
-        fields = ["name", "department", "engine", "env", "description", "is_active"]
+        fields = ["name", "alias", "department", "engine", "env", "description", "is_active"]
         labels = {
             "name": "集群名称",
+            "alias": "集群别名",
             "department": "所属部门",
             "engine": "数据库引擎",
             "env": "环境",
@@ -69,10 +70,12 @@ class ClusterForm(BootstrapMixin, forms.ModelForm):
         }
         help_texts = {
             "name": "同一部门内不可重名，不同部门可以重名",
+            "alias": "可选，全局唯一。控制台里可用「别名.实例别名」快速切换",
             "department": "集群必须归属一个部门",
         }
         widgets = {
             "name": forms.TextInput(attrs={"placeholder": "例如：core-mysql-prod"}),
+            "alias": forms.TextInput(attrs={"placeholder": "例如：jq1"}),
         }
 
     def __init__(self, *args, **kwargs):
@@ -101,6 +104,7 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
         model = Instance
         fields = [
             "name",
+            "alias",
             "cluster",
             "host",
             "port",
@@ -111,6 +115,7 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
         ]
         labels = {
             "name": "实例名称",
+            "alias": "实例别名",
             "cluster": "所属集群",
             "host": "主机地址",
             "port": "端口",
@@ -120,6 +125,7 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
             "is_active": "启用",
         }
         help_texts = {
+            "alias": "可选，集群内唯一。控制台里可用「集群别名.本别名」切换",
             "host": "支持 IP 或域名，例如 10.0.12.31 / db-01.internal",
             "port": "1 - 65535",
             "username": "用于连接数据库的账号名",
@@ -127,6 +133,7 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
         }
         widgets = {
             "name": forms.TextInput(attrs={"placeholder": "例如：core-mysql-prod-01"}),
+            "alias": forms.TextInput(attrs={"placeholder": "例如：ins1"}),
             "host": forms.TextInput(attrs={"placeholder": "10.0.12.31"}),
             "port": forms.NumberInput(attrs={"min": 1, "max": 65535}),
             "remark": forms.Textarea(attrs={"rows": 2}),

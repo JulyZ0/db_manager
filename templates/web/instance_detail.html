@@ -4,9 +4,9 @@
 {% block content %}
 <div class="page-head">
   <div>
-    <h1>{{ instance.name }}</h1>
+    <h1>{{ instance.name }}{% if instance.alias %} <span class="muted small mono">({{ instance.alias }})</span>{% endif %}</h1>
     <div class="sub">
-      {{ instance.cluster.department.name }} / {{ instance.cluster.name }}
+      {{ instance.cluster.department.name }} / {{ instance.cluster.name }}{% if instance.cluster.alias %} ({{ instance.cluster.alias }}){% endif %}
       · {{ instance.cluster.get_engine_display }}
       · {{ instance.cluster.get_env_display }}
     </div>
@@ -102,7 +102,88 @@
     <dt>耗时</dt>
     <dd>{% if instance.last_probe_latency_ms %}{{ instance.last_probe_latency_ms }} ms{% else %}-{% endif %}</dd>
   </dl>
+  <p class="muted small">
+    端口可达只说明网络通，不代表这组账号密码能登录。下面的凭据验证会真正连一次目标库。
+  </p>
 </div>
+
+<div class="card" id="cred-card"
+     data-url="{% url 'web:instance_verify_credentials' instance.id %}">
+  <h2>凭据验证 <span class="muted small">（页面打开时自动执行）</span></h2>
+  <dl class="kv">
+    <dt>验证结果</dt>
+    <dd id="cred-state">
+      <span class="badge badge-gray">正在连接目标库…</span>
+    </dd>
+    <dt>耗时</dt>
+    <dd id="cred-latency">-</dd>
+    <dt>服务端版本</dt>
+    <dd id="cred-version" class="mono">-</dd>
+    <dt>说明</dt>
+    <dd id="cred-hint" class="small muted">-</dd>
+  </dl>
+  <p class="muted small">
+    这里只连一次库确认账号密码可用，不执行任何语句、不修改任何数据，结果也不入库。
+  </p>
+  <button class="btn btn-sm" type="button" id="cred-retry">重新验证</button>
+</div>
+
+<script>
+(function () {
+  var card = document.getElementById("cred-card");
+  if (!card) return;
+
+  var stateEl = document.getElementById("cred-state");
+  var latencyEl = document.getElementById("cred-latency");
+  var versionEl = document.getElementById("cred-version");
+  var hintEl = document.getElementById("cred-hint");
+  var retryBtn = document.getElementById("cred-retry");
+
+  function setBadge(cls, text) {
+    stateEl.innerHTML = "";
+    var span = document.createElement("span");
+    span.className = "badge " + cls;
+    span.textContent = text;
+    stateEl.appendChild(span);
+  }
+
+  function render(data) {
+    if (data.ok) {
+      setBadge("badge-green", "账号密码可用");
+      latencyEl.textContent = data.latency_ms == null ? "-" : data.latency_ms + " ms";
+      versionEl.textContent = data.server_version || "-";
+      hintEl.textContent = "目标库接受这组凭据";
+    } else {
+      setBadge("badge-red", "连接失败");
+      latencyEl.textContent = "-";
+      versionEl.textContent = "-";
+      hintEl.textContent = data.hint || data.error || "未知原因";
+    }
+  }
+
+  function fail() {
+    setBadge("badge-gray", "验证请求失败");
+    hintEl.textContent = "无法访问服务，请确认程序仍在运行";
+  }
+
+  function run() {
+    setBadge("badge-gray", "正在连接目标库…");
+    latencyEl.textContent = "-";
+    versionEl.textContent = "-";
+    hintEl.textContent = "-";
+    retryBtn.disabled = true;
+
+    fetch(card.dataset.url, { headers: { "X-Requested-With": "XMLHttpRequest" } })
+      .then(function (resp) { return resp.json(); })
+      .then(render)
+      .catch(fail)
+      .finally(function () { retryBtn.disabled = false; });
+  }
+
+  retryBtn.addEventListener("click", run);
+  run();
+})();
+</script>
 
 <div class="card">
   <h2>轮换历史 <span class="muted small">（共 {{ rotation_count }} 条，显示最近 20 条）</span></h2>
