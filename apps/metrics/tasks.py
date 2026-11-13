@@ -40,11 +40,6 @@ def aggregate_daily_stats(self) -> dict[str, object]:
 
     try:
         rows = aggregate_for_date()
-    except NotImplementedError:
-        logger.warning(
-            "统计服务尚未实现（apps/metrics/services.py::aggregate_for_date），本次跳过"
-        )
-        return {"status": "not_implemented"}
     except Exception:
         logger.exception("每日统计任务失败，将按退避策略重试")
         raise

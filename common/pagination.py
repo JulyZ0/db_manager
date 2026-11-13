@@ -25,7 +25,8 @@ def paginate_queryset(
 ) -> dict[str, Any]:
     """对 QuerySet 切片并组装分页响应体。
 
-    TODO(手写): 若有需要，可在此追加 total 缓存、超页兜底等策略。
+    超页兜底：page 超出总页数时返回空列表而不是报错——
+    运维在筛选条件变化后回退浏览器历史时很容易落到不存在的页码。
     """
     page, page_size, offset = resolve_page_params(page, page_size)
     total = queryset.count()

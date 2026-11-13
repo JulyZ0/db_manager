@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 import uuid
 
 from django.conf import settings
 from django.http import HttpRequest, HttpResponse
+
+from common.timing import Stopwatch
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +47,12 @@ class RequestTimingMiddleware:
             response["X-Request-ID"] = request_id
             return response
 
-        started = time.perf_counter()
+        watch = Stopwatch(f"http:{request.method} {request.path}")
+
         try:
             response = self.get_response(request)
         except Exception:
-            duration_ms = int((time.perf_counter() - started) * 1000)
+            duration_ms = watch.stop()
             logger.warning(
                 "%s %s -> 500 in %dms request_id=%s (视图抛出异常)",
                 request.method,
@@ -61,7 +63,7 @@ class RequestTimingMiddleware:
             self._record_slow_request(request, request_id, 500, duration_ms)
             raise
 
-        duration_ms = int((time.perf_counter() - started) * 1000)
+        duration_ms = watch.stop()
         response["X-Request-ID"] = request_id
 
         logger.info(

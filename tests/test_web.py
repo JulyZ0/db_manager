@@ -3,7 +3,7 @@
 重点验证三件事：
 1. 每个页面都能真实渲染（模板语法、URL 反向解析、字段名拼写都对）；
 2. 表单能完成创建/编辑的完整往返；
-3. 四个核心算法尚未实现时，页面给提示而不是 500。
+3. 页面上的探测、轮换、统计按钮真的驱动核心算法并写回结果。
 """
 
 from __future__ import annotations
@@ -236,33 +236,50 @@ class TestFormRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# 核心算法未实现时的降级表现
+# 页面上的核心操作真实可用
 # ---------------------------------------------------------------------------
 
 
-class TestPendingFeaturesAreGraceful:
-    """四个核心算法是待手写的 TODO，页面必须给出可读提示而不是 500。"""
+class TestCoreActionsWorkFromPages:
+    """页面按钮必须真的驱动算法，而不是只给一句提示。"""
 
-    def test_probe_shows_hint(self, api_client, seeded):
-        resp = api_client.post(
-            f"/instances/{seeded['instance'].id}/probe/", follow=True
-        )
+    def test_probe_updates_instance_status(self, api_client, seeded):
+        """探测只连 host:port，用本地一个必然拒绝的端口验证分类码写回页面。"""
+        instance = seeded["instance"]
+        instance.host = "127.0.0.1"
+        instance.port = 1  # 几乎不可能有服务监听
+        instance.save(update_fields=["host", "port"])
+
+        resp = api_client.post(f"/instances/{instance.id}/probe/", follow=True)
         assert resp.status_code == 200
-        assert "待实现" in resp.content.decode() or "尚未实现" in resp.content.decode()
 
-    def test_rotate_shows_hint(self, api_client, seeded):
-        resp = api_client.post(
-            f"/instances/{seeded['instance'].id}/rotate/", follow=True
-        )
+        instance.refresh_from_db()
+        assert instance.last_probed_at is not None
+        assert instance.last_probe_ok is False
+        assert instance.status == Instance.Status.OFFLINE
+
+    def test_rotate_increments_version_and_writes_history(self, api_client, seeded):
+        instance = seeded["instance"]
+        before = instance.password_version
+
+        resp = api_client.post(f"/instances/{instance.id}/rotate/", follow=True)
         assert resp.status_code == 200
-        assert "待实现" in resp.content.decode() or "尚未实现" in resp.content.decode()
 
-    def test_stats_rebuild_shows_hint(self, api_client, seeded):
+        instance.refresh_from_db()
+        assert instance.password_version == before + 1
+        assert instance.password_set is True
+        assert instance.rotation_logs.count() == 1
+        assert instance.rotation_logs.first().status == "success"
+
+    def test_stats_rebuild_writes_rows(self, api_client, seeded):
         resp = api_client.post("/stats/rebuild/", follow=True)
         assert resp.status_code == 200
-        assert "待实现" in resp.content.decode() or "尚未实现" in resp.content.decode()
 
-    def test_create_instance_with_password_shows_hint(self, api_client, seeded):
+        from apps.metrics.models import DailyInstanceStat
+
+        assert DailyInstanceStat.objects.count() == 1
+
+    def test_create_instance_with_password_encrypts(self, api_client, seeded):
         resp = api_client.post(
             "/instances/new/",
             data={
@@ -276,10 +293,14 @@ class TestPendingFeaturesAreGraceful:
                 "is_active": "on",
             },
         )
-        # 加密未实现时不应该把实例存进去，也不应该 500
-        assert resp.status_code == 200
-        assert not Instance.objects.filter(name="with-pwd").exists()
-        assert "尚未实现" in resp.content.decode() or "待实现" in resp.content.decode()
+        assert resp.status_code == 302
+
+        created = Instance.objects.get(name="with-pwd")
+        assert created.password_set is True
+        # 落库的是密文，不是原密码
+        assert "S3cret!" not in created.password_ciphertext
+        assert created.password_ciphertext.startswith("v1:")
+        assert created.password_version == 1
 
 
 # ---------------------------------------------------------------------------

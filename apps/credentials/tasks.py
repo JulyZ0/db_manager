@@ -42,13 +42,6 @@ def rotate_all_passwords(self) -> dict[str, object]:
 
     try:
         stats = rotate_all()
-    except NotImplementedError:
-        # 核心算法尚未实现时，不要让 autoretry 空转三次（每次退避最长 5 分钟），
-        # 只提示一次，等实现后下个周期自动生效。
-        logger.warning(
-            "轮换服务尚未实现（apps/credentials/services.py::rotate_all），本周期跳过"
-        )
-        return {"status": "not_implemented"}
     except Exception:
         logger.exception("批量密码轮换整体失败，将按退避策略重试")
         raise

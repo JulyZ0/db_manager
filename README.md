@@ -92,7 +92,7 @@ python manage.py ensure_admin
 | 提示依赖安装失败 | 检查网络；公司网络需要代理时先设置 `HTTP_PROXY` 环境变量 |
 | 端口被占用 | 启动器会自动换端口，窗口里会打印实际地址 |
 | 想确认环境是否正常 | 在项目目录运行 `python launcher.py --check` |
-| 页面提示某功能"尚未实现" | 见下方「待手写清单」，对应的核心算法还没写 |
+| 页面提示"轮换失败" | 实例被停用（停用实例不参与轮换），或另一处正在轮换同一实例 |
 
 ### 6. 备份与恢复
 
@@ -138,15 +138,15 @@ db_manager/
 │   │   └── admin.py          ✅
 │   ├── probing/              # TCP 探测
 │   │   ├── api.py            ✅
-│   │   └── services.py       ⬜ probe_tcp 待手写
+│   │   └── services.py       ✅ probe_tcp
 │   ├── credentials/          # 加密与轮换
-│   │   ├── crypto.py         ⬜ 加解密 / 密码生成待手写
-│   │   ├── services.py       ⬜ rotate_one / rotate_all 待手写
+│   │   ├── crypto.py         ✅ 加解密 / 密码生成 / 指纹
+│   │   ├── services.py       ✅ rotate_one / rotate_all
 │   │   ├── tasks.py          ✅ Celery 包装层
 │   │   └── api.py            ✅
 │   ├── metrics/              # 统计与观测
 │   │   ├── models.py         ✅
-│   │   ├── services.py       ⬜ aggregate_for_date 待手写
+│   │   ├── services.py       ✅ aggregate_for_date
 │   │   ├── tasks.py          ✅ Celery 包装层
 │   │   ├── api.py            ✅
 │   │   └── management/commands/aggregate_instance_stats.py  ✅
@@ -154,46 +154,54 @@ db_manager/
 │       ├── forms.py          ✅ 3 个 ModelForm
 │       ├── views.py          ✅ 13 个视图
 │       └── urls.py           ✅
+├── common/timing.py          ✅ 计时组件（中间件与任务共用）
 ├── templates/                # base + 各类页面模板
 ├── static/css/app.css        # 全站样式（纯本地，无 CDN）
-└── tests/                    ✅ 82 项测试
+└── tests/                    ✅ 全部通过
 ```
 
-### 2.2 待手写清单（四个核心算法）
+### 2.2 核心算法实现说明
 
-除下列四处外，其余全部实现完毕。每处都写了 `TODO(手写)` 注释说明要求。
+四个核心算法均已实现，对应测试见 `tests/test_algorithms.py`。
 
 #### ① 加密与密码生成 —— `apps/credentials/crypto.py`
 
-| 函数 | 要求 |
+| 函数 | 实现要点 |
 |---|---|
-| `encrypt_secret` | Fernet 加密，返回 `v1:<token>` |
-| `decrypt_secret` | 校验版本前缀；`InvalidToken` 转 `DecryptionError` |
-| `generate_password` | `secrets` 模块，长度默认 32，大小写/数字/符号各至少一个 |
+| `encrypt_secret` | Fernet 加密，返回 `v1:<token>`；**不加缓存**，保证相同明文得到不同密文 |
+| `decrypt_secret` | 校验 `v1:` 版本前缀；`InvalidToken` / 格式错误转 `DecryptionError` |
+| `generate_password` | `secrets` 生成，长度默认 32；四类字符各至少一个后整体洗牌 |
+| `fingerprint` | `sha256` 前 16 位，供轮换审计比对 |
 
-`fingerprint()` 已实现（纯 `hashlib`）。
+> 安全说明：`encrypt_secret` 特意不加 `lru_cache`。加了缓存会让相同密码在库里
+> 留下相同密文（泄露"哪些实例共用同一密码"），还会把明文长期驻留在进程内存。
+> 缓存的只有 `Fernet` 实例本身（`_build_fernet`），它不含任何敏感数据。
 
 #### ② TCP 探测 —— `apps/probing/services.py`
 
-`probe_tcp`：`socket.create_connection` + `perf_counter` 计时，
-异常映射为 `timeout` / `refused` / `dns_failed` / `network_unreachable` / `unknown`。
-**必须不向外抛异常**——探测不到是业务结论，不是服务端错误。
+`socket.create_connection` + `perf_counter` 计时，异常映射为
+`timeout` / `refused` / `dns_failed` / `network_unreachable` / `unknown`。
+**任何分支都不向外抛异常**——探测不到是业务结论，不是服务端错误。
+errno 常量用 `hasattr` 过滤，避免在部分平台上 import 即失败。
 
 #### ③ 密码轮换 —— `apps/credentials/services.py`
 
 - `rotate_one`：事务 + `select_for_update` → 旧密码指纹 → 新密码加密落库 →
-  `password_version += 1` → 写 `PasswordRotationLog`
-- `rotate_all`：`iterator(chunk_size=100)` 分批，单条失败不中断整批
+  `password_version += 1` → 写 `PasswordRotationLog`。
+  并发用**乐观锁**兜底（更新条件带旧 `password_version`），因为 SQLite 会
+  静默忽略 `select_for_update`。失败历史在事务外写，避免随回滚一起丢失。
+- `rotate_all`：按 id 游标分批（默认 100），单条失败不中断整批。
+  不用 `.iterator()` 是因为边读边写同一张表在 SQLite 上容易表锁。
 
 #### ④ 每日统计 —— `apps/metrics/services.py`
 
-`aggregate_for_date`：按 `cluster__department` 聚合，`update_or_create` 保证幂等，
-关键点是**同时写 `department_name` / `cluster_name` 快照值**，避免日后改名篡改历史。
+`aggregate_for_date`：单条 SQL 按 `cluster__department` 聚合，
+`update_or_create` 保证幂等，关键是**同时写 `department_name` / `cluster_name`
+快照值**，避免日后改名篡改历史。
 
-> 说明：`apps/credentials/tasks.py` 与 `apps/metrics/tasks.py` 已实现——它们是
-> Celery 包装层（日志、耗时、重试），不属于核心算法。两者在核心算法未实现时会
-> 记录一条 WARNING 并返回 `{"status": "not_implemented"}`，避免 `autoretry`
-> 空转三次（每次最长退避 5 分钟）。实现完算法后无需改动任务层，下个周期自动生效。
+> 说明：`apps/credentials/tasks.py` 与 `apps/metrics/tasks.py` 是 Celery 包装层
+> （日志、耗时、重试），不属于核心算法。整体性故障仍会向上抛，让 `autoretry`
+> 按退避策略重试；单实例失败由 `rotate_all` 内部消化并计入 `failed`。
 
 ### 2.3 已完成的装配
 

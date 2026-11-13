@@ -385,7 +385,6 @@ def create_instance(request: HttpRequest, payload: InstanceIn):
     version = 0
     updated_at = None
     if payload.password:
-        # 加密属于待手写的核心算法之一（apps/credentials/crypto.py）
         from apps.credentials.crypto import encrypt_secret
 
         ciphertext = encrypt_secret(payload.password)

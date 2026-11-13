@@ -1,6 +1,6 @@
 """credentials 接口：手动轮换与轮换历史查询。
 
-加解密与轮换算法在 crypto.py / services.py（待手写），本文件负责
+加解密与轮换算法在 crypto.py / services.py，本文件负责
 实例存在性校验、停用校验与历史分页。
 """
 

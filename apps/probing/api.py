@@ -1,6 +1,6 @@
 """probing 接口：按需触发 TCP 可达性探测。
 
-探测算法本身在 apps/probing/services.py（待手写），本文件负责：
+探测算法本身在 apps/probing/services.py，本文件负责：
 - 只按实例 ID 取 host/port，不接受客户端传入任意端点（防内网 SSRF）
 - 探测失败仍返回 200（"不可达"是有效业务结论）
 - 回写实例的探测结果字段

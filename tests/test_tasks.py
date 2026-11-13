@@ -1,11 +1,10 @@
 """周期任务包装层测试。
 
-两个 task 是 Celery 包装，真正的算法在 services 里（待手写）。
+两个 task 是 Celery 包装，真正的算法在 services 里。
 这里验证的是包装层本身的行为：
 
 1. 调度器能按 "apps.xxx.tasks.yyy" 路径解析到任务对象；
-2. 核心算法还没实现时，任务**返回降级结果**而不是抛异常
-   ——否则 autoretry 会空转三次，每次退避最长 5 分钟；
+2. 任务能真实执行并返回统计结果；
 3. 真正的整体故障仍然向上抛，让 autoretry 生效。
 """
 
@@ -44,23 +43,33 @@ class TestSchedulerCanResolve:
             assert scheduler._resolve_task(task_path) is not None, task_path
 
 
-class TestGracefulDegradation:
-    """核心算法未实现时应返回降级结果，不触发无限重试。"""
+class TestTaskExecution:
+    """算法落地后，任务包装层应真实执行并返回统计结果。"""
 
-    def test_rotation_returns_not_implemented(self):
+    def test_rotation_task_returns_stats(self):
         result = credential_tasks.rotate_all_passwords()
-        assert result["status"] == "not_implemented"
+        assert result["total"] == 0
+        assert result["success"] == 0
+        assert result["failed"] == 0
+        assert "duration_ms" in result
 
-    def test_aggregation_returns_not_implemented(self):
+    def test_aggregation_task_returns_row_count(self):
         result = metric_tasks.aggregate_daily_stats()
-        assert result["status"] == "not_implemented"
+        assert result["rows"] == 0
+        assert "duration_ms" in result
 
-    def test_degradation_is_logged_as_warning(self, caplog):
-        import logging
+    def test_rotation_task_processes_instances(self, db):
+        from apps.assets.models import Cluster, Department, Instance
 
-        with caplog.at_level(logging.WARNING):
-            credential_tasks.rotate_all_passwords()
-        assert any("尚未实现" in record.message for record in caplog.records)
+        dept = Department.objects.create(name="任务部")
+        cluster = Cluster.objects.create(name="task-cluster", department=dept)
+        Instance.objects.create(
+            name="t1", cluster=cluster, host="10.1.1.1", port=3306, username="u"
+        )
+
+        result = credential_tasks.rotate_all_passwords()
+        assert result["success"] == 1
+        assert result["failed"] == 0
 
     def test_real_failure_still_raises(self, monkeypatch):
         """整体性故障不能被降级逻辑吞掉，否则 autoretry 永远不会触发。"""

@@ -3,8 +3,8 @@
 设计原则：
 1. 面向不熟悉命令行的运维人员，所有操作都有按钮与表单，不需要记 URL。
 2. 危险操作（删除、手动轮换）走 POST + CSRF，不用 GET 触发副作用。
-3. 四个核心算法（探测、加密、轮换、统计）尚未手写，
-   调用它们时捕获 NotImplementedError，页面显示"功能待实现"而不是 500。
+3. 核心算法（探测、加密、轮换、统计）在 apps/*/services.py 与 crypto.py 中实现，
+   页面只负责调用与结果提示，不承担业务逻辑。
 """
 
 from __future__ import annotations
@@ -27,16 +27,6 @@ from common import scheduler as scheduler_mod
 from common.pagination import DEFAULT_PAGE_SIZE, paginate_queryset
 
 logger = logging.getLogger(__name__)
-
-# 四个待手写算法的提示语，统一措辞便于运维识别
-PENDING_HINT = (
-    "该功能依赖尚未实现的核心算法（{what}）。"
-    "请先在 {file} 中完成实现，再回来使用。"
-)
-
-
-def _pending_message(what: str, file: str) -> str:
-    return PENDING_HINT.format(what=what, file=file)
 
 
 def _page(request: HttpRequest) -> int:
@@ -363,25 +353,9 @@ def instance_create(request: HttpRequest) -> HttpResponse:
             instance: Instance = form.save(commit=False)
             password = form.cleaned_data.get("password") or ""
             if password:
-                # 加密属于待手写的核心算法
                 from apps.credentials.crypto import encrypt_secret
 
-                try:
-                    instance.password_ciphertext = encrypt_secret(password)
-                except NotImplementedError:
-                    messages.error(
-                        request,
-                        _pending_message("密码加密", "apps/credentials/crypto.py"),
-                    )
-                    return render(
-                        request,
-                        "web/instance_form.html",
-                        {
-                            "active_nav": "instances",
-                            "form": form,
-                            "is_edit": False,
-                        },
-                    )
+                instance.password_ciphertext = encrypt_secret(password)
                 instance.password_version = 1
                 instance.password_updated_at = timezone.now()
             instance.save()
@@ -413,23 +387,7 @@ def instance_edit(request: HttpRequest, instance_id: int) -> HttpResponse:
             if password:
                 from apps.credentials.crypto import encrypt_secret
 
-                try:
-                    obj.password_ciphertext = encrypt_secret(password)
-                except NotImplementedError:
-                    messages.error(
-                        request,
-                        _pending_message("密码加密", "apps/credentials/crypto.py"),
-                    )
-                    return render(
-                        request,
-                        "web/instance_form.html",
-                        {
-                            "active_nav": "instances",
-                            "form": form,
-                            "is_edit": True,
-                            "object": instance,
-                        },
-                    )
+                obj.password_ciphertext = encrypt_secret(password)
                 obj.password_version += 1
                 obj.password_updated_at = timezone.now()
             obj.save()
@@ -462,13 +420,7 @@ def instance_probe(request: HttpRequest, instance_id: int) -> HttpResponse:
 
     from apps.probing.services import probe_tcp
 
-    try:
-        result = probe_tcp(instance.host, instance.port)
-    except NotImplementedError:
-        messages.warning(
-            request, _pending_message("TCP 探测", "apps/probing/services.py")
-        )
-        return redirect("web:instance_detail", instance_id=instance.id)
+    result = probe_tcp(instance.host, instance.port)
 
     probed_at = timezone.now()
     instance.last_probed_at = probed_at
@@ -512,11 +464,9 @@ def instance_rotate(request: HttpRequest, instance_id: int) -> HttpResponse:
 
     try:
         log = rotate_one(instance, source="manual")
-    except NotImplementedError:
-        messages.warning(
-            request,
-            _pending_message("密码轮换", "apps/credentials/services.py"),
-        )
+    except Exception as exc:  # noqa: BLE001 - 面向运维的页面，失败要给可读提示而非 500
+        # 失败历史已由 rotate_one 写入审计表（含异常类型），这里只提示运维
+        messages.error(request, f"轮换失败：{exc}")
         return redirect("web:instance_detail", instance_id=instance.id)
 
     if log.status == PasswordRotationLog.Status.SUCCESS:
@@ -584,14 +534,7 @@ def stats_rebuild(request: HttpRequest) -> HttpResponse:
 
     from apps.metrics.services import aggregate_for_date
 
-    try:
-        rows = aggregate_for_date(stat_date)
-    except NotImplementedError:
-        messages.warning(
-            request,
-            _pending_message("每日统计聚合", "apps/metrics/services.py"),
-        )
-        return redirect(f"{reverse('web:stats')}?stat_date={stat_date.isoformat()}")
+    rows = aggregate_for_date(stat_date)
 
     messages.success(request, f"{stat_date} 的统计已重算，写入 {rows} 行")
     return redirect(f"{reverse('web:stats')}?stat_date={stat_date.isoformat()}")
