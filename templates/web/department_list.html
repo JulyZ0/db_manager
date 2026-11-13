@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}部门管理 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>部门管理</h1>
+    <div class="sub">部门是资源归属与成本分摊的最上层维度</div>
+  </div>
+  <div class="actions">
+    <a class="btn btn-primary" href="{% url 'web:department_create' %}">新增部门</a>
+  </div>
+</div>
+
+<form method="get" class="filters">
+  <div class="field">
+    <label for="search">搜索</label>
+    <input type="text" id="search" name="search" value="{{ search }}" placeholder="名称或编码">
+  </div>
+  <button class="btn" type="submit">筛选</button>
+  {% if search %}<a class="btn btn-sm" href="{% url 'web:department_list' %}">清空</a>{% endif %}
+</form>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>名称</th><th>编码</th><th>负责人</th><th>集群数</th><th>状态</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for dept in departments %}
+          <tr>
+            <td><strong>{{ dept.name }}</strong></td>
+            <td class="mono">{{ dept.code|default:"-" }}</td>
+            <td>{{ dept.owner|default:"-" }}</td>
+            <td class="num">
+              {% if dept.cluster_count %}
+                <a href="{% url 'web:cluster_list' %}?department_id={{ dept.id }}">{{ dept.cluster_count }}</a>
+              {% else %}0{% endif %}
+            </td>
+            <td>
+              {% if dept.is_active %}
+                <span class="badge badge-green">启用</span>
+              {% else %}
+                <span class="badge badge-gray">停用</span>
+              {% endif %}
+            </td>
+            <td>
+              <div class="actions">
+                <a class="btn btn-sm" href="{% url 'web:department_edit' dept.id %}">编辑</a>
+                <a class="btn btn-sm" href="{% url 'web:cluster_create' %}?department_id={{ dept.id }}">加集群</a>
+                <form class="inline-form" method="post"
+                      action="{% url 'web:department_delete' dept.id %}"
+                      onsubmit="return confirm('确定删除部门「{{ dept.name }}」？');">
+                  {% csrf_token %}
+                  <button class="btn btn-sm btn-danger" type="submit">删除</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="6" class="empty">还没有部门，点击右上角「新增部门」开始</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% include "web/_pagination.html" with base_query=base_query %}
+</div>
+{% endblock %}

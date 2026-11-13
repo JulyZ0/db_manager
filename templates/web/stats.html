@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}数量统计 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>数量统计</h1>
+    <div class="sub">按「部门 × 集群」维度的实例数量快照，每天 00:00 自动生成</div>
+  </div>
+  <div class="actions">
+    <form class="inline-form" method="post" action="{% url 'web:stats_rebuild' %}">
+      {% csrf_token %}
+      <input type="hidden" name="stat_date" value="{{ stat_date|date:'Y-m-d' }}">
+      <button class="btn btn-primary" type="submit">重算 {{ stat_date|date:"Y-m-d" }}</button>
+    </form>
+  </div>
+</div>
+
+<form method="get" class="filters">
+  <div class="field">
+    <label for="stat_date">统计日期</label>
+    <input type="date" id="stat_date" name="stat_date" value="{{ stat_date|date:'Y-m-d' }}">
+  </div>
+  <button class="btn" type="submit">查询</button>
+  <a class="btn btn-sm" href="{% url 'web:stats' %}?stat_date={{ today|date:'Y-m-d' }}">今天</a>
+  <a class="btn btn-sm" href="{% url 'web:stats' %}?stat_date={{ yesterday|date:'Y-m-d' }}">昨天</a>
+</form>
+
+{% if recent_dates %}
+  <div class="card">
+    <h2 class="mt-0">已有快照的日期</h2>
+    <div class="actions">
+      {% for d in recent_dates %}
+        <a class="btn btn-sm{% if d == stat_date %} btn-primary{% endif %}"
+           href="{% url 'web:stats' %}?stat_date={{ d|date:'Y-m-d' }}">{{ d|date:"Y-m-d" }}</a>
+      {% endfor %}
+    </div>
+  </div>
+{% endif %}
+
+<div class="cards">
+  <div class="stat-card">
+    <div class="label">{{ stat_date|date:"Y-m-d" }} 实例总数</div>
+    <div class="value">{{ total_instances }}</div>
+    <div class="hint">该日期所有启用实例</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">其中在线</div>
+    <div class="value">{{ total_active }}</div>
+    <div class="hint">状态为 online 的实例</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">统计行数</div>
+    <div class="value">{{ rows|length }}</div>
+    <div class="hint">一行对应一个集群</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>部门</th><th>集群</th><th>实例数</th><th>在线数</th><th>生成时间</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          <tr>
+            <td>{{ row.department_name }}</td>
+            <td>{{ row.cluster_name }}</td>
+            <td class="num">{{ row.instance_count }}</td>
+            <td class="num">{{ row.active_count }}</td>
+            <td class="small muted">{{ row.created_at|date:"Y-m-d H:i:s" }}</td>
+          </tr>
+        {% empty %}
+          <tr>
+            <td colspan="5" class="empty">
+              {{ stat_date|date:"Y-m-d" }} 还没有统计数据。
+              可以点右上角「重算」立即生成（需要统计聚合算法已实现）。
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

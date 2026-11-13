@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}{% if is_edit %}编辑部门{% else %}新增部门{% endif %} · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{% if is_edit %}编辑部门{% else %}新增部门{% endif %}</h1>
+    <div class="sub">带 <span style="color:#b91c1c">*</span> 的为必填项</div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{% url 'web:department_list' %}">返回列表</a>
+  </div>
+</div>
+
+<div class="card">
+  <form method="post" novalidate>
+    {% csrf_token %}
+    {% include "web/_form_fields.html" with form=form %}
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">{% if is_edit %}保存修改{% else %}创建部门{% endif %}</button>
+      <a class="btn" href="{% url 'web:department_list' %}">取消</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

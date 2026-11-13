@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}{% if is_edit %}编辑实例{% else %}新增实例{% endif %} · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{% if is_edit %}编辑实例{% else %}新增实例{% endif %}</h1>
+    <div class="sub">
+      {% if is_edit %}
+        密码留空表示不修改；填写后立即加密入库并让版本号 +1
+      {% else %}
+        带 <span style="color:#b91c1c">*</span> 的为必填项，密码可以稍后再设
+      {% endif %}
+    </div>
+  </div>
+  <div class="actions">
+    {% if is_edit %}
+      <a class="btn" href="{% url 'web:instance_detail' object.id %}">返回详情</a>
+    {% else %}
+      <a class="btn" href="{% url 'web:instance_list' %}">返回列表</a>
+    {% endif %}
+  </div>
+</div>
+
+{% if not form.fields.cluster.queryset.exists %}
+  <div class="notice">
+    还没有任何集群。请先 <a href="{% url 'web:cluster_create' %}">创建集群</a>，再回来创建实例。
+  </div>
+{% endif %}
+
+<div class="card">
+  <form method="post" novalidate>
+    {% csrf_token %}
+    <div class="form-grid">
+      {% for field in form %}
+        {% if field.field.widget.input_type == "checkbox" %}
+          <div class="field">
+            <div class="checkbox">
+              {{ field }}
+              <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+            </div>
+            {% if field.help_text %}<div class="help">{{ field.help_text }}</div>{% endif %}
+            {% for error in field.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+          </div>
+        {% elif field.name == "password" %}
+          <div class="field">
+            <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+            {{ field }}
+            {% if field.help_text %}<div class="help">{{ field.help_text }}</div>{% endif %}
+            {% for error in field.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+            {% if is_edit and object.password_set %}
+              <div class="help">
+                当前密码版本 v{{ object.password_version }}，
+                更新于 {{ object.password_updated_at|date:"Y-m-d H:i" }}
+              </div>
+            {% endif %}
+          </div>
+        {% else %}
+          <div class="field{% if 'textarea' in field.field.widget.template_name %} full{% endif %}">
+            <label for="{{ field.id_for_label }}"
+                   {% if field.field.required %}class="required"{% endif %}>{{ field.label }}</label>
+            {{ field }}
+            {% if field.help_text %}<div class="help">{{ field.help_text }}</div>{% endif %}
+            {% for error in field.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+          </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+
+    {% if form.non_field_errors %}
+      <div class="alert alert-error" style="margin-top:14px">
+        {% for error in form.non_field_errors %}<div>{{ error }}</div>{% endfor %}
+      </div>
+    {% endif %}
+
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">{% if is_edit %}保存修改{% else %}创建实例{% endif %}</button>
+      {% if is_edit %}
+        <a class="btn" href="{% url 'web:instance_detail' object.id %}">取消</a>
+      {% else %}
+        <a class="btn" href="{% url 'web:instance_list' %}">取消</a>
+      {% endif %}
+    </div>
+  </form>
+</div>
+{% endblock %}

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}慢请求 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>慢请求</h1>
+    <div class="sub">耗时超过阈值的请求会被记录在这里，便于定位性能问题</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th><th>请求 ID</th><th>方法</th><th>路径</th>
+          <th>状态码</th><th>耗时</th><th>来源 IP</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in logs %}
+          <tr>
+            <td class="nowrap">{{ log.created_at|date:"Y-m-d H:i:s" }}</td>
+            <td class="mono">{{ log.request_id }}</td>
+            <td>{{ log.method }}</td>
+            <td class="mono">{{ log.path }}</td>
+            <td>
+              {% if log.status_code >= 500 %}
+                <span class="badge badge-red">{{ log.status_code }}</span>
+              {% elif log.status_code >= 400 %}
+                <span class="badge badge-amber">{{ log.status_code }}</span>
+              {% else %}
+                <span class="badge badge-green">{{ log.status_code }}</span>
+              {% endif %}
+            </td>
+            <td class="num">{{ log.duration_ms }} ms</td>
+            <td class="mono small">{{ log.remote_addr|default:"-" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="7" class="empty">目前没有慢请求记录</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% include "web/_pagination.html" with base_query=base_query %}
+</div>
+{% endblock %}

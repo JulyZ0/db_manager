@@ -1,0 +1,33 @@
+{% comment %}
+统一的表单字段渲染片段。
+用法：{% include "web/_form_fields.html" with form=form %}
+勾选框与文本域单独排版，其余按两列网格排列。
+{% endcomment %}
+<div class="form-grid">
+  {% for field in form %}
+    {% if field.field.widget.input_type == "checkbox" %}
+      <div class="field">
+        <div class="checkbox">
+          {{ field }}
+          <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+        </div>
+        {% if field.help_text %}<div class="help">{{ field.help_text }}</div>{% endif %}
+        {% for error in field.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+    {% else %}
+      <div class="field{% if 'textarea' in field.field.widget.template_name %} full{% endif %}">
+        <label for="{{ field.id_for_label }}"
+               {% if field.field.required %}class="required"{% endif %}>{{ field.label }}</label>
+        {{ field }}
+        {% if field.help_text %}<div class="help">{{ field.help_text }}</div>{% endif %}
+        {% for error in field.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+    {% endif %}
+  {% endfor %}
+</div>
+
+{% if form.non_field_errors %}
+  <div class="alert alert-error" style="margin-top:14px">
+    {% for error in form.non_field_errors %}<div>{{ error }}</div>{% endfor %}
+  </div>
+{% endif %}

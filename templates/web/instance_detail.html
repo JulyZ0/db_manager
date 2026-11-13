@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}{{ instance.name }} · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ instance.name }}</h1>
+    <div class="sub">
+      {{ instance.cluster.department.name }} / {{ instance.cluster.name }}
+      · {{ instance.cluster.get_engine_display }}
+      · {{ instance.cluster.get_env_display }}
+    </div>
+  </div>
+  <div class="actions">
+    <form class="inline-form" method="post" action="{% url 'web:instance_probe' instance.id %}">
+      {% csrf_token %}
+      <button class="btn btn-primary" type="submit">立即探测</button>
+    </form>
+    <form class="inline-form" method="post" action="{% url 'web:instance_rotate' instance.id %}"
+          onsubmit="return confirm('确定立即轮换该实例的密码？');">
+      {% csrf_token %}
+      <button class="btn" type="submit" {% if not instance.is_active %}disabled{% endif %}>轮换密码</button>
+    </form>
+    <a class="btn" href="{% url 'web:instance_edit' instance.id %}">编辑</a>
+    <a class="btn" href="{% url 'web:instance_list' %}">返回列表</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>基本信息</h2>
+  <dl class="kv">
+    <dt>连接地址</dt>
+    <dd class="mono">{{ instance.host }}:{{ instance.port }}</dd>
+    <dt>角色</dt>
+    <dd>{{ instance.get_role_display }}</dd>
+    <dt>登录账号</dt>
+    <dd class="mono">{{ instance.username }}</dd>
+    <dt>状态</dt>
+    <dd>
+      {% if instance.status == "online" %}
+        <span class="badge badge-green">在线</span>
+      {% elif instance.status == "offline" %}
+        <span class="badge badge-red">离线</span>
+      {% else %}
+        <span class="badge badge-gray">未知（尚未探测）</span>
+      {% endif %}
+      {% if not instance.is_active %}<span class="badge badge-gray">已停用</span>{% endif %}
+    </dd>
+    <dt>启用状态</dt>
+    <dd>
+      {% if instance.is_active %}
+        启用中
+        <span class="muted small">（会参与每 12 小时的自动轮换）</span>
+      {% else %}
+        已停用
+        <span class="muted small">（不参与自动轮换）</span>
+      {% endif %}
+    </dd>
+    <dt>备注</dt>
+    <dd>{{ instance.remark|default:"-" }}</dd>
+    <dt>创建 / 更新</dt>
+    <dd class="small muted">
+      {{ instance.created_at|date:"Y-m-d H:i:s" }} / {{ instance.updated_at|date:"Y-m-d H:i:s" }}
+    </dd>
+  </dl>
+</div>
+
+<div class="card">
+  <h2>密码</h2>
+  <dl class="kv">
+    <dt>是否已设置</dt>
+    <dd>
+      {% if instance.password_set %}
+        <span class="badge badge-green">已设置</span>
+      {% else %}
+        <span class="badge badge-gray">未设置</span>
+      {% endif %}
+      <span class="muted small">密码仅以密文入库，页面上永不回显</span>
+    </dd>
+    <dt>当前版本</dt>
+    <dd>v{{ instance.password_version }}</dd>
+    <dt>最近更新</dt>
+    <dd>{{ instance.password_updated_at|date:"Y-m-d H:i:s"|default:"-" }}</dd>
+  </dl>
+</div>
+
+<div class="card">
+  <h2>连通性</h2>
+  <dl class="kv">
+    <dt>最近探测时间</dt>
+    <dd>{{ instance.last_probed_at|date:"Y-m-d H:i:s"|default:"从未探测" }}</dd>
+    <dt>最近探测结果</dt>
+    <dd>
+      {% if instance.last_probe_ok is None %}
+        <span class="muted">-</span>
+      {% elif instance.last_probe_ok %}
+        <span class="badge badge-green">可达</span>
+      {% else %}
+        <span class="badge badge-red">不可达</span>
+      {% endif %}
+    </dd>
+    <dt>耗时</dt>
+    <dd>{% if instance.last_probe_latency_ms %}{{ instance.last_probe_latency_ms }} ms{% else %}-{% endif %}</dd>
+  </dl>
+</div>
+
+<div class="card">
+  <h2>轮换历史 <span class="muted small">（共 {{ rotation_count }} 条，显示最近 20 条）</span></h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>时间</th><th>来源</th><th>结果</th><th>旧指纹</th><th>新指纹</th><th>耗时</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        {% for log in rotations %}
+          <tr>
+            <td class="nowrap">{{ log.created_at|date:"Y-m-d H:i:s" }}</td>
+            <td>{{ log.get_source_display }}</td>
+            <td>
+              {% if log.status == "success" %}
+                <span class="badge badge-green">成功</span>
+              {% else %}
+                <span class="badge badge-red">失败</span>
+              {% endif %}
+            </td>
+            <td class="mono">{{ log.old_fingerprint|default:"-" }}</td>
+            <td class="mono">{{ log.new_fingerprint|default:"-" }}</td>
+            <td class="num">{{ log.duration_ms|default:"-" }} ms</td>
+            <td class="small">{{ log.error_message|default:"-" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="7" class="empty">还没有轮换记录</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

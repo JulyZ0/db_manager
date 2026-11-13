@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}{% if is_edit %}编辑集群{% else %}新增集群{% endif %} · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{% if is_edit %}编辑集群{% else %}新增集群{% endif %}</h1>
+    <div class="sub">同一部门内集群名不可重复，不同部门可以重名</div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{% url 'web:cluster_list' %}">返回列表</a>
+  </div>
+</div>
+
+{% if not form.fields.department.queryset.exists %}
+  <div class="notice">
+    还没有任何部门。请先 <a href="{% url 'web:department_create' %}">创建部门</a>，再回来创建集群。
+  </div>
+{% endif %}
+
+<div class="card">
+  <form method="post" novalidate>
+    {% csrf_token %}
+    {% include "web/_form_fields.html" with form=form %}
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">{% if is_edit %}保存修改{% else %}创建集群{% endif %}</button>
+      <a class="btn" href="{% url 'web:cluster_list' %}">取消</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

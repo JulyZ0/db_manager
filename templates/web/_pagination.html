@@ -1,0 +1,15 @@
+{% comment %}
+统一的分页控件。参数：page / count / page_size / has_prev / has_next / base_query
+base_query 是除 page 之外的查询串（不含 ? 与 &），可为空。
+{% endcomment %}
+{% if count %}
+  <div class="pagination">
+    <span>共 {{ count }} 条，第 {{ page }} 页</span>
+    {% if has_prev %}
+      <a href="?{% if base_query %}{{ base_query }}&{% endif %}page={{ page|add:"-1" }}">上一页</a>
+    {% endif %}
+    {% if has_next %}
+      <a href="?{% if base_query %}{{ base_query }}&{% endif %}page={{ page|add:"1" }}">下一页</a>
+    {% endif %}
+  </div>
+{% endif %}

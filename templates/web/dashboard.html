@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}总览 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>总览</h1>
+    <div class="sub">资产家底、连通状态与最近任务一览（{{ now|date:"Y-m-d H:i" }}）</div>
+  </div>
+  <div class="actions">
+    <a class="btn btn-primary" href="{% url 'web:instance_create' %}">新增实例</a>
+    <a class="btn" href="{% url 'web:cluster_create' %}">新增集群</a>
+    <a class="btn" href="{% url 'web:department_create' %}">新增部门</a>
+  </div>
+</div>
+
+<div class="cards">
+  <div class="stat-card">
+    <div class="label">部门</div>
+    <div class="value">{{ counts.departments }}</div>
+    <div class="hint">组织维度</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">集群</div>
+    <div class="value">{{ counts.clusters }}</div>
+    <div class="hint">实例的逻辑分组</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">实例总数</div>
+    <div class="value">{{ counts.instances }}</div>
+    <div class="hint">其中启用 {{ counts.active_instances }} 个</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">在线 / 离线 / 未知</div>
+    <div class="value">
+      <span style="color:#15803d">{{ status_counts.online }}</span> /
+      <span style="color:#b91c1c">{{ status_counts.offline }}</span> /
+      <span style="color:#6b7280">{{ status_counts.unknown }}</span>
+    </div>
+    <div class="hint">未知表示尚未探测</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>运行状态</h2>
+  <dl class="kv">
+    <dt>定时任务调度</dt>
+    <dd>
+      {% if scheduler_mode == "celery" %}
+        <span class="badge badge-green">Celery</span> 已连接消息队列，按计划执行轮换与统计
+      {% elif scheduler_mode == "inprocess" %}
+        <span class="badge badge-amber">进程内调度</span> 未检测到 Redis，已自动降级为本进程内定时执行
+      {% else %}
+        <span class="badge badge-gray">{{ scheduler_mode }}</span>
+      {% endif %}
+    </dd>
+    <dt>最近统计日期</dt>
+    <dd>
+      {% if last_stat_date %}
+        {{ last_stat_date }}
+        <a class="small" href="{% url 'web:stats' %}?stat_date={{ last_stat_date|date:'Y-m-d' }}">查看</a>
+      {% else %}
+        <span class="muted">尚无统计数据，可到「数量统计」页手动重算</span>
+      {% endif %}
+    </dd>
+    <dt>最近一次轮换</dt>
+    <dd>
+      {% if last_rotation %}
+        {{ last_rotation.created_at|date:"Y-m-d H:i:s" }}
+        · {{ last_rotation.instance.name }}
+        {% if last_rotation.status == "success" %}
+          <span class="badge badge-green">成功</span>
+        {% else %}
+          <span class="badge badge-red">失败</span>
+        {% endif %}
+      {% else %}
+        <span class="muted">尚无轮换记录</span>
+      {% endif %}
+    </dd>
+  </dl>
+</div>
+
+<div class="card">
+  <h2>最近新增的实例</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>实例</th><th>集群</th><th>地址</th><th>角色</th><th>状态</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for instance in recent_instances %}
+          <tr>
+            <td><a href="{% url 'web:instance_detail' instance.id %}">{{ instance.name }}</a></td>
+            <td>{{ instance.cluster.department.name }} / {{ instance.cluster.name }}</td>
+            <td class="mono">{{ instance.host }}:{{ instance.port }}</td>
+            <td>{{ instance.get_role_display }}</td>
+            <td>
+              {% if instance.status == "online" %}
+                <span class="badge badge-green">在线</span>
+              {% elif instance.status == "offline" %}
+                <span class="badge badge-red">离线</span>
+              {% else %}
+                <span class="badge badge-gray">未知</span>
+              {% endif %}
+            </td>
+            <td><a class="btn btn-sm" href="{% url 'web:instance_detail' instance.id %}">详情</a></td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="6" class="empty">还没有实例，点击右上角「新增实例」开始登记</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>最近的密码轮换</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>时间</th><th>实例</th><th>来源</th><th>结果</th><th>耗时</th></tr>
+      </thead>
+      <tbody>
+        {% for log in recent_rotations %}
+          <tr>
+            <td class="nowrap">{{ log.created_at|date:"Y-m-d H:i:s" }}</td>
+            <td>{{ log.instance.name }}</td>
+            <td>{{ log.get_source_display }}</td>
+            <td>
+              {% if log.status == "success" %}
+                <span class="badge badge-green">成功</span>
+              {% else %}
+                <span class="badge badge-red">失败</span>
+              {% endif %}
+            </td>
+            <td class="num">{{ log.duration_ms|default:"-" }} ms</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="5" class="empty">还没有轮换记录</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
