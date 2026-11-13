@@ -61,11 +61,18 @@ class TestTaskExecution:
 
     def test_rotation_task_processes_instances(self, db):
         from apps.assets.models import Cluster, Department, Instance
+        from apps.credentials.crypto import encrypt_secret
 
         dept = Department.objects.create(name="任务部")
         cluster = Cluster.objects.create(name="task-cluster", department=dept)
         Instance.objects.create(
-            name="t1", cluster=cluster, host="10.1.1.1", port=3306, username="u"
+            name="t1",
+            cluster=cluster,
+            host="10.1.1.1",
+            port=3306,
+            username="u",
+            # 真实改密要先用旧密码登录目标库
+            password_ciphertext=encrypt_secret("Old@Passw0rd01"),
         )
 
         result = credential_tasks.rotate_all_passwords()

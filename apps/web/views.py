@@ -277,6 +277,46 @@ def cluster_edit(request: HttpRequest, cluster_id: int) -> HttpResponse:
     )
 
 
+def cluster_detail(request: HttpRequest, cluster_id: int) -> HttpResponse:
+    """集群详情：拓扑画布 + 节点清单 + 架构一致性提示。
+
+    拓扑数据由 build_topology() 生成，与 /api/v1/clusters/{id}/topology
+    同源，避免页面与接口各算一套。
+    """
+    from apps.assets.topology import build_topology
+
+    cluster = get_object_or_404(
+        Cluster.objects.select_related("department"), id=cluster_id
+    )
+    topology = build_topology(cluster)
+
+    return render(
+        request,
+        "web/cluster_detail.html",
+        {
+            "active_nav": "clusters",
+            "cluster": cluster,
+            "topology": topology,
+            # 画布要的是 JSON，模板里用 json_script 输出更安全（不拼字符串）
+            "instances": cluster.instances.select_related("replica_of").order_by(
+                "role", "name"
+            ),
+        },
+    )
+
+
+def cluster_topology(request: HttpRequest, cluster_id: int) -> JsonResponse:
+    """拓扑画布的数据源。
+
+    页面首屏已经把同一份数据用 json_script 内联，这个接口留给
+    "画布加载失败后重试"和外部轮询刷新用，两条路径同源。
+    """
+    from apps.assets.topology import build_topology
+
+    cluster = get_object_or_404(Cluster, id=cluster_id)
+    return JsonResponse(build_topology(cluster))
+
+
 @login_required_page
 @require_POST
 def cluster_delete(request: HttpRequest, cluster_id: int) -> HttpResponse:

@@ -534,8 +534,9 @@ def test_console_instances_lists_all(anon_client, seeded):
     assert item["engine"] == "mysql"
     assert item["env"] == "生产"
     # 只暴露"有没有密码"，不暴露内容
-    assert item["password_set"] is False
+    assert item["password_set"] is True
     assert "password" not in item
+    assert "password_ciphertext" not in item
 
 
 def test_console_switch_by_instance_id(anon_client, seeded):
@@ -639,7 +640,18 @@ def test_console_help_mentions_sw_not_use(api_client, seeded):
 
 
 def test_console_verify_reports_no_password(anon_client, seeded):
-    resp = anon_client.get(f"/console/{seeded['instance'].id}/verify.json")
+    """未登记密码的实例，验证结果必须是 no_password，而不是"成功"。"""
+    from apps.assets.models import Instance
+
+    bare = Instance.objects.create(
+        name="no-pwd",
+        cluster=seeded["cluster"],
+        host="10.0.0.7",
+        port=3306,
+        username="app",
+    )
+
+    resp = anon_client.get(f"/console/{bare.id}/verify.json")
 
     assert resp.status_code == 200
     data = resp.json()

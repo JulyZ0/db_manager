@@ -22,6 +22,7 @@ from apps.assets.schemas import (
     ClusterIn,
     ClusterOut,
     ClusterPatch,
+    ClusterTopologyOut,
     DepartmentIn,
     DepartmentOut,
     DepartmentPatch,
@@ -31,6 +32,9 @@ from apps.assets.schemas import (
     PagedClusterOut,
     PagedDepartmentOut,
     PagedInstanceOut,
+    TopologyEdgeOut,
+    TopologyNodeOut,
+    TopologyWarningOut,
 )
 from common.auth import django_session_auth
 from common.exceptions import ConflictError, NotFoundError
@@ -68,6 +72,7 @@ def _cluster_out(obj: Cluster) -> ClusterOut:
         department_name=obj.department.name,
         engine=obj.engine,
         env=obj.env,
+        topology=obj.topology,
         description=obj.description,
         is_active=obj.is_active,
         instance_count=getattr(obj, "instance_count", 0),
@@ -88,6 +93,8 @@ def _instance_out(obj: Instance) -> InstanceOut:
         host=obj.host,
         port=obj.port,
         role=obj.role,
+        replica_of_id=obj.replica_of_id,
+        replica_of_name=obj.replica_of.name if obj.replica_of_id else "",
         username=obj.username,
         password_set=bool(obj.password_ciphertext),
         password_version=obj.password_version,
@@ -118,7 +125,9 @@ def _get_cluster(cluster_id: int) -> Cluster:
 
 def _get_instance(instance_id: int) -> Instance:
     obj = (
-        Instance.objects.select_related("cluster", "cluster__department")
+        Instance.objects.select_related(
+            "cluster", "cluster__department", "replica_of"
+        )
         .filter(id=instance_id)
         .first()
     )
@@ -171,6 +180,39 @@ def _assert_instance_alias_free(
         raise ConflictError(
             f"该集群内已存在实例别名「{alias}」", detail={"field": "alias"}
         )
+
+
+def _resolve_replica_upstream(
+    upstream_id: int | None,
+    *,
+    cluster_id: int,
+    exclude_id: int | None = None,
+) -> Instance | None:
+    """把 replica_of_id 解析成实例，并校验复制关系合法。
+
+    三条规矩：必须存在、必须同集群、不能指向自己。放在接口层提前拦，
+    是为了返回 409 的统一错误体；模型层的 clean() 仍是最后一道防线
+    （管理后台等其它写入路径会走它）。
+    """
+    if upstream_id is None:
+        return None
+
+    if exclude_id is not None and upstream_id == exclude_id:
+        raise ConflictError("复制上游不能是自己", detail={"field": "replica_of_id"})
+
+    upstream = Instance.objects.filter(id=upstream_id).first()
+    if upstream is None:
+        raise NotFoundError(f"复制上游实例 {upstream_id} 不存在")
+
+    if upstream.cluster_id != cluster_id:
+        raise ConflictError(
+            f"复制上游「{upstream.name}」不属于本集群，跨集群复制不在台账登记范围",
+            detail={
+                "field": "replica_of_id",
+                "upstream_cluster_id": upstream.cluster_id,
+            },
+        )
+    return upstream
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +380,7 @@ def create_cluster(request: HttpRequest, payload: ClusterIn):
         department=department,
         engine=payload.engine,
         env=payload.env,
+        topology=payload.topology,
         description=payload.description,
         is_active=payload.is_active,
     )
@@ -350,6 +393,24 @@ def get_cluster(request: HttpRequest, cluster_id: int):
     obj = _get_cluster(cluster_id)
     obj.instance_count = obj.instances.count()
     return _cluster_out(obj)
+
+
+@clusters_router.get(
+    "/{cluster_id}/topology",
+    response=ClusterTopologyOut,
+    summary="集群拓扑",
+)
+def get_cluster_topology(request: HttpRequest, cluster_id: int):
+    """返回该集群的拓扑数据：节点、复制边、一致性提示。
+
+    只读接口，不要求登录：拓扑图与实例列表同属"浏览"类信息，
+    内网工具里让值班同学随手看一眼比强制登录更有用。
+    """
+    from apps.assets.topology import build_topology
+
+    obj = _get_cluster(cluster_id)
+    data = build_topology(obj)
+    return ClusterTopologyOut(**data)
 
 
 @clusters_router.patch(
@@ -461,6 +522,10 @@ def create_instance(request: HttpRequest, payload: InstanceIn):
     alias = _clean_alias(payload.alias)
     _assert_instance_alias_free(payload.cluster_id, alias)
 
+    upstream = _resolve_replica_upstream(
+        payload.replica_of_id, cluster_id=payload.cluster_id
+    )
+
     ciphertext = ""
     version = 0
     updated_at = None
@@ -478,6 +543,7 @@ def create_instance(request: HttpRequest, payload: InstanceIn):
         host=payload.host,
         port=payload.port,
         role=payload.role,
+        replica_of=upstream,
         username=payload.username,
         password_ciphertext=ciphertext,
         password_version=version,
@@ -530,6 +596,15 @@ def update_instance(request: HttpRequest, instance_id: int, payload: InstancePat
         )
 
     data.pop("cluster_id", None)
+
+    # replica_of_id 用 exclude_unset 判断：显式传 null 表示解除复制关系，
+    # 所以不能靠真值判断（None 也是有意义的指令）。
+    if "replica_of_id" in data:
+        upstream_id = data.pop("replica_of_id")
+        obj.replica_of = _resolve_replica_upstream(
+            upstream_id, cluster_id=target_cluster_id, exclude_id=obj.id
+        )
+
     for field, value in data.items():
         setattr(obj, field, value)
 

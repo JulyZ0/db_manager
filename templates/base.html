@@ -73,6 +73,8 @@
 {# 折叠后的把手：固定在视口右边缘，点一下重新展开 #}
 <button class="qc-handle" type="button" id="qc-handle" title="打开快速连接终端">快速连接</button>
 
+{# 页面级第三方库：只有需要的页面才加载，避免每页都拖一个 370KB 的文件 #}
+{% block vendor_scripts %}{% endblock %}
 {% block scripts %}{% endblock %}
 <script src="{% static 'js/quick_console.js' %}" defer></script>
 </body>

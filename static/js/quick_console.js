@@ -352,6 +352,10 @@
     });
 
     state.ready = true;
+    // 同步一次初始可见性：抽屉默认收起，把手必须同步显示出来。
+    // 少了这一步，.qc-handle 会一直停在 CSS 的 display:none 上，
+    // 详情页上就再也没有入口能把这个面板打开——看起来就像"样式全丢了"。
+    setOpen(false);
     updateChrome();
   }
 

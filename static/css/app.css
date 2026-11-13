@@ -464,3 +464,52 @@ td.num { font-variant-numeric: tabular-nums; }
 .qc-handle:hover { background: #1f2937; }
 
 body.qc-open .main { padding-right: 548px; }
+
+/* ---------- 集群拓扑 ---------- */
+
+.topo-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.topo-head h2 { margin: 0; }
+
+.topo-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+.topo-key { display: inline-flex; align-items: center; gap: 5px; }
+.topo-key-hint { color: var(--muted); }
+.topo-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+}
+.dot-master { background: #dbeafe; border-color: #2563eb; }
+.dot-slave { background: #dcfce7; border-color: #15803d; }
+.dot-proxy { background: #eef1f5; border-color: #6b7280; }
+.dot-offline { background: #fee2e2; border-color: #b91c1c; border-style: dashed; }
+
+/* 画布给一个固定高度：cytoscape 需要一个有确定尺寸的容器，
+   否则容器高度为 0，图会"画了但看不见" */
+.topo-canvas {
+  width: 100%;
+  height: 460px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fbfcfd;
+}
+.topo-fallback { padding: 12px 0; }
+
+@media (max-width: 720px) {
+  .topo-canvas { height: 340px; }
+}

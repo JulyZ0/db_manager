@@ -29,6 +29,14 @@ urlpatterns = [
     # 集群
     path("clusters/", views.cluster_list, name="cluster_list"),
     path("clusters/new/", views.cluster_create, name="cluster_create"),
+    path(
+        "clusters/<int:cluster_id>/", views.cluster_detail, name="cluster_detail"
+    ),
+    path(
+        "clusters/<int:cluster_id>/topology.json",
+        views.cluster_topology,
+        name="cluster_topology",
+    ),
     path("clusters/<int:cluster_id>/edit/", views.cluster_edit, name="cluster_edit"),
     path(
         "clusters/<int:cluster_id>/delete/", views.cluster_delete, name="cluster_delete"

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from django.core.exceptions import ValidationError
 from django.db import models
 
 from apps.assets.validators import (
@@ -63,6 +64,18 @@ class Cluster(TimeStampedModel):
         TEST = "test", "测试"
         PROD = "prod", "生产"
 
+    class Topology(models.TextChoices):
+        """集群架构类型。
+
+        只声明"这一组实例按什么形态部署"，具体的复制方向由
+        Instance.replica_of 表达：双主就是两台互指上游。
+        """
+
+        STANDALONE = "standalone", "单机"
+        MASTER_SLAVE = "master_slave", "主从"
+        DUAL_MASTER = "dual_master", "双主"
+        SHARDED = "sharded", "分片集群"
+
     name = models.CharField("集群名称", max_length=100)
     # 集群别名全局唯一：控制台里可以只写一个词就切到某个集群
     alias = models.CharField(
@@ -85,6 +98,13 @@ class Cluster(TimeStampedModel):
     )
     env = models.CharField(
         "环境", max_length=10, choices=Env.choices, default=Env.DEV
+    )
+    topology = models.CharField(
+        "集群架构",
+        max_length=20,
+        choices=Topology.choices,
+        default=Topology.STANDALONE,
+        help_text="声明部署形态；具体复制方向由实例的「复制上游」决定",
     )
     description = models.TextField("描述", blank=True, default="")
     is_active = models.BooleanField("是否启用", default=True)
@@ -147,6 +167,17 @@ class Instance(TimeStampedModel):
     role = models.CharField(
         "角色", max_length=10, choices=Role.choices, default=Role.MASTER
     )
+    # 复制上游：这一台从谁同步。有方向，所以用自引用而不是 M2M。
+    # 双主就是两台互指；级联复制 A→B→C 只需要 C.replica_of = B。
+    replica_of = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,  # 主库被删后从库保留，只是失去上游
+        related_name="replicas",
+        verbose_name="复制上游",
+        null=True,
+        blank=True,
+        help_text="从库填写它所跟随的主库；双主场景两台互相填写",
+    )
     username = models.CharField("登录账号", max_length=64)
 
     # 敏感字段：Fernet 密文，形如 v1:<base64>
@@ -178,6 +209,36 @@ class Instance(TimeStampedModel):
         # 集群内别名唯一；空串会互相冲突，统一存 NULL
         self.alias = normalize_alias(self.alias)
         super().save(*args, **kwargs)
+
+    def clean(self):
+        """复制关系必须指向同集群的另一个实例。
+
+        放在模型层而不是表单层，是因为 API 与页面两条写入路径都要生效；
+        Django 会在 full_clean() 时调用，保存时各自触发。
+        """
+        super().clean()
+
+        if self.replica_of is None:
+            return
+
+        errors = {}
+        if self.replica_of_id == self.pk:
+            errors["replica_of"] = "复制上游不能是自己"
+        elif (
+            self.cluster_id
+            and self.replica_of.cluster_id != self.cluster_id
+        ):
+            errors["replica_of"] = (
+                f"复制上游「{self.replica_of.name}」不属于本集群，"
+                "跨集群的复制关系不在本系统登记范围内"
+            )
+        if errors:
+            raise ValidationError(errors)
+
+    @property
+    def upstream_name(self) -> str:
+        """拓扑图与列表要显示的"上游是谁"，避免模板里到处判空。"""
+        return self.replica_of.name if self.replica_of_id else ""
 
     class Meta:
         db_table = "assets_instance"

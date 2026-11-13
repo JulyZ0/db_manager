@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ cluster.name }} · 集群拓扑{% endblock %}
+
+{% block vendor_scripts %}
+<script src="{% static 'js/vendor/cytoscape.min.js' %}"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ cluster.name }}{% if cluster.alias %} <span class="muted small mono">({{ cluster.alias }})</span>{% endif %}</h1>
+    <div class="sub">
+      {{ cluster.department.name }}
+      · {{ cluster.get_engine_display }}
+      · {{ cluster.get_env_display }}
+      · 架构：{{ topology.topology_label }}
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn btn-primary" href="{% url 'web:instance_create' %}?cluster_id={{ cluster.id }}">加实例</a>
+    <a class="btn" href="{% url 'web:cluster_edit' cluster.id %}">编辑集群</a>
+    <a class="btn" href="{% url 'web:instance_list' %}?cluster_id={{ cluster.id }}">实例列表</a>
+    <a class="btn" href="{% url 'web:cluster_list' %}">返回</a>
+  </div>
+</div>
+
+{# 架构声明与实际复制关系不一致时的软提示：只提示，不阻断任何操作 #}
+{% if topology.warnings %}
+  <div class="messages">
+    {% for warning in topology.warnings %}
+      <div class="alert alert-warning">{{ warning.message }}</div>
+    {% endfor %}
+  </div>
+{% endif %}
+
+<div class="card">
+  <div class="topo-head">
+    <h2>拓扑图</h2>
+    <div class="topo-legend">
+      <span class="topo-key"><i class="topo-dot dot-master"></i>主库</span>
+      <span class="topo-key"><i class="topo-dot dot-slave"></i>从库</span>
+      <span class="topo-key"><i class="topo-dot dot-proxy"></i>代理</span>
+      <span class="topo-key"><i class="topo-dot dot-offline"></i>离线/停用</span>
+      <span class="topo-key topo-key-hint">箭头指向复制上游 · 点节点可打开终端</span>
+    </div>
+  </div>
+
+  {% if topology.nodes %}
+    <div id="topology-canvas" class="topo-canvas"
+         data-topology-url="{% url 'web:cluster_topology' cluster.id %}"></div>
+    <div id="topology-fallback" class="topo-fallback" hidden>
+      <p class="muted">画布未能加载（浏览器不支持或脚本被拦截），下方节点清单包含同样的信息。</p>
+    </div>
+  {% else %}
+    <p class="empty">
+      这个集群还没有实例。
+      <a href="{% url 'web:instance_create' %}?cluster_id={{ cluster.id }}">先加一个实例</a>，
+      再回来配置主从关系。
+    </p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>节点清单</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>实例</th>
+          <th>角色</th>
+          <th>连接地址</th>
+          <th>复制上游</th>
+          <th>状态</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for instance in instances %}
+          <tr>
+            <td>
+              <a href="{% url 'web:instance_detail' instance.id %}">{{ instance.name }}</a>
+              {% if instance.alias %}<span class="muted small mono">{{ instance.alias }}</span>{% endif %}
+            </td>
+            <td>
+              {% if instance.role == "master" %}
+                <span class="badge badge-blue">主库</span>
+              {% elif instance.role == "slave" %}
+                <span class="badge badge-green">从库</span>
+              {% else %}
+                <span class="badge badge-gray">代理</span>
+              {% endif %}
+            </td>
+            <td class="mono">{{ instance.host }}:{{ instance.port }}</td>
+            <td>
+              {% if instance.replica_of %}
+                <a href="{% url 'web:instance_detail' instance.replica_of.id %}">{{ instance.replica_of.name }}</a>
+              {% else %}
+                <span class="muted">—</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if not instance.is_active %}
+                <span class="badge badge-gray">停用</span>
+              {% elif instance.status == "online" %}
+                <span class="badge badge-green">在线</span>
+              {% elif instance.status == "offline" %}
+                <span class="badge badge-red">离线</span>
+              {% else %}
+                <span class="badge badge-gray">未知</span>
+              {% endif %}
+            </td>
+            <td>
+              <div class="actions">
+                <a class="btn btn-sm" href="{% url 'web:instance_edit' instance.id %}">编辑</a>
+                <button class="btn btn-sm" type="button"
+                        data-terminal-instance="{{ instance.id }}"
+                        {% if not instance.is_active %}disabled{% endif %}>终端</button>
+              </div>
+            </td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="6" class="empty">暂无实例</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{{ topology|json_script:"topology-data" }}
+{% endblock %}
+
+{% block scripts %}
+<script src="{% static 'js/topology.js' %}" defer></script>
+{% endblock %}

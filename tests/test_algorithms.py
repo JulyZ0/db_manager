@@ -37,15 +37,32 @@ def cluster(dept):
     return Cluster.objects.create(name="core-mysql-prod", department=dept)
 
 
+def make_instance(cluster, *, name, host, port=3306, username="u", password=None, **kwargs):
+    """建一个"已登记密码"的实例。
+
+    轮换要先拿旧密码登录目标库才能改密，因此所有轮换类用例都必须
+    从"密码已登记"这个前提出发；password_version 保持默认 0，
+    这样"轮换一次后为 1"的断言依然直观。
+    """
+    if password is None:
+        password = "Old@Passw0rd01"
+
+    from apps.credentials.crypto import encrypt_secret
+
+    return Instance.objects.create(
+        name=name,
+        cluster=cluster,
+        host=host,
+        port=port,
+        username=username,
+        password_ciphertext=encrypt_secret(password),
+        **kwargs,
+    )
+
+
 @pytest.fixture
 def instance(cluster):
-    return Instance.objects.create(
-        name="core-01",
-        cluster=cluster,
-        host="10.0.0.1",
-        port=3306,
-        username="app",
-    )
+    return make_instance(cluster, name="core-01", host="10.0.0.1", username="app")
 
 
 @pytest.fixture
@@ -320,8 +337,8 @@ class TestRotateOne:
         log = rotate_one(instance)
         assert log.new_fingerprint
         assert len(log.new_fingerprint) == 16
-        # 首次轮换没有旧密码，旧指纹为空
-        assert log.old_fingerprint == ""
+        # 实例已有初始密码，旧指纹应当是它算出来的，而不是空
+        assert log.old_fingerprint
         assert PasswordRotationLog.objects.filter(instance=instance).count() == 1
 
     def test_second_rotation_records_old_fingerprint(self, instance):
@@ -356,7 +373,7 @@ class TestRotateOne:
         """单个实例内部报错时必须留审计，并把异常交给调用方。"""
         from apps.credentials import services
 
-        def boom():
+        def boom(length=None):
             raise RuntimeError("生成失败")
 
         monkeypatch.setattr(services, "generate_password", boom)
@@ -375,7 +392,7 @@ class TestRotateOne:
 
         original_generate = services.generate_password
 
-        def generate_and_bump():
+        def generate_and_bump(length=None):
             # 模拟另一个 worker 抢先完成了一次轮换
             Instance.objects.filter(pk=instance.pk).update(
                 password_version=instance.password_version + 1
@@ -403,17 +420,8 @@ class TestRotateAll:
         """AC-11：停用实例不被轮换。"""
         from apps.credentials.services import rotate_all
 
-        active = Instance.objects.create(
-            name="a", cluster=cluster, host="10.0.0.1", port=3306, username="u"
-        )
-        inactive = Instance.objects.create(
-            name="b",
-            cluster=cluster,
-            host="10.0.0.2",
-            port=3306,
-            username="u",
-            is_active=False,
-        )
+        active = make_instance(cluster, name="a", host="10.0.0.1")
+        inactive = make_instance(cluster, name="b", host="10.0.0.2", is_active=False)
 
         stats = rotate_all()
         assert stats == {"success": 1, "failed": 0, "total": 1}
@@ -428,13 +436,7 @@ class TestRotateAll:
         from apps.credentials.services import rotate_all
 
         for i in range(25):
-            Instance.objects.create(
-                name=f"i{i}",
-                cluster=cluster,
-                host=f"10.0.1.{i}",
-                port=3306,
-                username="u",
-            )
+            make_instance(cluster, name=f"i{i}", host=f"10.0.1.{i}")
 
         stats = rotate_all(batch_size=10)
         assert stats["total"] == 25
@@ -446,13 +448,7 @@ class TestRotateAll:
         from apps.credentials import services
 
         for i in range(3):
-            Instance.objects.create(
-                name=f"i{i}",
-                cluster=cluster,
-                host=f"10.0.2.{i}",
-                port=3306,
-                username="u",
-            )
+            make_instance(cluster, name=f"i{i}", host=f"10.0.2.{i}")
 
         original = services.rotate_one
 
@@ -477,9 +473,7 @@ class TestRotateAllScope:
     """按策略范围轮换：只动勾选到的实例，长度按档位生成。"""
 
     def _make(self, cluster, name, host, **kwargs):
-        return Instance.objects.create(
-            name=name, cluster=cluster, host=host, port=3306, username="u", **kwargs
-        )
+        return make_instance(cluster, name=name, host=host, **kwargs)
 
     def test_instance_ids_limits_scope(self, cluster):
         from apps.credentials.services import rotate_all

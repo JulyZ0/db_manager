@@ -65,13 +65,23 @@ class DepartmentForm(BootstrapMixin, forms.ModelForm):
 class ClusterForm(BootstrapMixin, forms.ModelForm):
     class Meta:
         model = Cluster
-        fields = ["name", "alias", "department", "engine", "env", "description", "is_active"]
+        fields = [
+            "name",
+            "alias",
+            "department",
+            "engine",
+            "env",
+            "topology",
+            "description",
+            "is_active",
+        ]
         labels = {
             "name": "集群名称",
             "alias": "集群别名",
             "department": "所属部门",
             "engine": "数据库引擎",
             "env": "环境",
+            "topology": "集群架构",
             "description": "描述",
             "is_active": "启用",
         }
@@ -79,6 +89,7 @@ class ClusterForm(BootstrapMixin, forms.ModelForm):
             "name": "同一部门内不可重名，不同部门可以重名",
             "alias": "可选，全局唯一。控制台里可用「别名.实例别名」快速切换",
             "department": "集群必须归属一个部门",
+            "topology": "声明部署形态；实例之间谁跟谁同步，在实例上填「复制上游」",
         }
         widgets = {
             "name": forms.TextInput(attrs={"placeholder": "例如：core-mysql-prod"}),
@@ -89,6 +100,14 @@ class ClusterForm(BootstrapMixin, forms.ModelForm):
         super().__init__(*args, **kwargs)
         self.fields["department"].queryset = Department.objects.order_by("name")
         self.fields["department"].empty_label = "请选择部门"
+        # 架构是"声明"而不是硬性约束：新建时给个安全默认（单机），
+        # 也让漏传该字段的旧表单/脚本不至于保存失败。
+        self.fields["topology"].required = False
+        if not self.instance.pk:
+            self.fields["topology"].initial = Cluster.Topology.STANDALONE
+
+    def clean_topology(self):
+        return self.cleaned_data.get("topology") or Cluster.Topology.STANDALONE
 
 
 class InstanceForm(BootstrapMixin, forms.ModelForm):
@@ -116,6 +135,7 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
             "host",
             "port",
             "role",
+            "replica_of",
             "username",
             "remark",
             "is_active",
@@ -127,6 +147,7 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
             "host": "主机地址",
             "port": "端口",
             "role": "角色",
+            "replica_of": "复制上游",
             "username": "登录账号",
             "remark": "备注",
             "is_active": "启用",
@@ -135,6 +156,8 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
             "alias": "可选，集群内唯一。控制台里可用「集群别名.本别名」切换",
             "host": "支持 IP 或域名，例如 10.0.12.31 / db-01.internal",
             "port": "1 - 65535",
+            "role": "主库/从库/代理；仅用于标注这台实例的定位",
+            "replica_of": "从库填它跟随的主库；双主场景两台互填；单机留空",
             "username": "用于连接数据库的账号名",
             "is_active": "只有启用的实例才会参与定时密码轮换",
         }
@@ -156,6 +179,39 @@ class InstanceForm(BootstrapMixin, forms.ModelForm):
         self.fields["cluster"].empty_label = "请选择集群"
         # 让下拉框显示"部门/集群"，避免同名集群选错
         self.fields["cluster"].label_from_instance = lambda c: f"{c.department.name} / {c.name}"
+
+        # 复制上游只允许选同集群的实例；这里先给出全量候选项，
+        # 真正"必须同集群"由 clean() 判定（切集群时下拉不会跟着变）
+        replica_field = self.fields["replica_of"]
+        replica_field.queryset = (
+            Instance.objects.select_related("cluster").order_by(
+                "cluster__name", "name"
+            )
+        )
+        replica_field.empty_label = "无（单机 / 主库）"
+        replica_field.label_from_instance = lambda i: (
+            f"{i.cluster.name} / {i.name} ({i.host}:{i.port})"
+        )
+        if self.instance.pk:
+            # 不能把自己选成自己的上游
+            replica_field.queryset = replica_field.queryset.exclude(
+                id=self.instance.pk
+            )
+
+    def clean(self):
+        cleaned = super().clean()
+        cluster = cleaned.get("cluster")
+        upstream = cleaned.get("replica_of")
+
+        if upstream is None:
+            return cleaned
+
+        if cluster and upstream.cluster_id != cluster.id:
+            self.add_error(
+                "replica_of",
+                "复制上游必须与本实例属于同一集群：跨集群的复制关系不在台账登记范围",
+            )
+        return cleaned
 
     def clean_port(self):
         port = self.cleaned_data.get("port")

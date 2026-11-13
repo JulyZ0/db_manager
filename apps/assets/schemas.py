@@ -68,6 +68,8 @@ class ClusterIn(Schema):
     department_id: int
     engine: Cluster.Engine = Cluster.Engine.MYSQL
     env: Cluster.Env = Cluster.Env.DEV
+    # 架构形态；具体复制方向由实例的 replica_of 表达
+    topology: Cluster.Topology = Cluster.Topology.STANDALONE
     description: str = ""
     is_active: bool = True
 
@@ -78,6 +80,7 @@ class ClusterPatch(Schema):
     department_id: int | None = None
     engine: Cluster.Engine | None = None
     env: Cluster.Env | None = None
+    topology: Cluster.Topology | None = None
     description: str | None = None
     is_active: bool | None = None
 
@@ -90,6 +93,7 @@ class ClusterOut(Schema):
     department_name: str
     engine: str
     env: str
+    topology: str
     description: str
     is_active: bool
     instance_count: int = 0
@@ -116,6 +120,8 @@ class InstanceIn(Schema):
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(ge=1, le=65535)
     role: Instance.Role = Instance.Role.MASTER
+    # 复制上游：必须是同集群内的另一个实例
+    replica_of_id: int | None = None
     username: str = Field(min_length=1, max_length=64)
     # 只进不出：写入后由服务端加密落库，任何读接口都不返回
     password: str | None = None
@@ -130,6 +136,8 @@ class InstancePatch(Schema):
     host: str | None = Field(default=None, max_length=255)
     port: int | None = Field(default=None, ge=1, le=65535)
     role: Instance.Role | None = None
+    # 显式传 null 表示解除复制关系，因此要用 exclude_unset 判断而非真值判断
+    replica_of_id: int | None = None
     username: str | None = Field(default=None, max_length=64)
     password: str | None = None
     remark: str | None = None
@@ -147,6 +155,8 @@ class InstanceOut(Schema):
     host: str
     port: int
     role: str
+    replica_of_id: int | None
+    replica_of_name: str
     username: str
     # 密钥字段绝不出现，只暴露"是否已设置"与版本
     password_set: bool
@@ -189,3 +199,61 @@ class PagedRotationLogOut(Schema):
     page: int
     page_size: int
     results: list[RotationLogOut]
+
+
+# ---------------------------------------------------------------------------
+# 集群拓扑
+# ---------------------------------------------------------------------------
+
+
+class TopologyNodeOut(Schema):
+    """拓扑图上的一个节点，就是一台实例。"""
+
+    id: int
+    name: str
+    alias: str | None
+    host: str
+    port: int
+    role: str
+    status: str
+    is_active: bool
+    # 前端用它决定节点是否可点开终端
+    password_set: bool
+    # 谁指向它 / 它指向谁，由 edges 表达；这里只标"是不是有上游"
+    has_upstream: bool
+    upstream_name: str
+
+
+class TopologyEdgeOut(Schema):
+    """一条复制关系：source 从 target 同步。
+
+    双主是两条方向相反的边，前端据此画双向箭头。
+    """
+
+    source: int
+    target: int
+    kind: str = "replication"
+
+
+class TopologyWarningOut(Schema):
+    """架构声明与实际关系不一致时的软提示。
+
+    只提示不阻断：新建集群时往往还没有实例，硬校验会卡死录入流程。
+    """
+
+    code: str
+    message: str
+
+
+class ClusterTopologyOut(Schema):
+    cluster_id: int
+    cluster_name: str
+    cluster_alias: str | None
+    topology: str
+    topology_label: str
+    engine: str
+    env: str
+    department_name: str
+    nodes: list[TopologyNodeOut]
+    edges: list[TopologyEdgeOut]
+    warnings: list[TopologyWarningOut]

@@ -52,7 +52,7 @@
       <tbody>
         {% for cluster in clusters %}
           <tr>
-            <td><strong>{{ cluster.name }}</strong>{% if cluster.alias %}<div class="muted small mono">别名 {{ cluster.alias }}</div>{% endif %}</td>
+            <td><strong><a href="{% url 'web:cluster_detail' cluster.id %}">{{ cluster.name }}</a></strong>{% if cluster.alias %}<div class="muted small mono">别名 {{ cluster.alias }}</div>{% endif %}</td>
             <td>{{ cluster.department.name }}</td>
             <td>{{ cluster.get_engine_display }}</td>
             <td>
