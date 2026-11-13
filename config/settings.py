@@ -157,7 +157,10 @@ LOGIN_URL = "/admin/login/"
 LOGIN_REDIRECT_URL = "/admin/"
 LOGOUT_REDIRECT_URL = "/admin/login/"
 
-STATIC_URL = "static/"
+# 必须带前导斜杠：写成 "static/" 时 {% static %} 会输出相对路径，
+# 在深层页面（如 /instances/3/）会被解析成 /instances/3/static/... 而 404，
+# 表现为"详情页样式全丢了、首页却正常"。
+STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 # 页面样式全部本地化，不依赖 CDN：目标机器可能没有外网
 STATICFILES_DIRS = [BASE_DIR / "static"]
@@ -284,6 +287,10 @@ PASSWORD_LENGTH = env_int("PASSWORD_LENGTH", 32)
 # PostgreSQL 等支持行级并发写的后端默认 4。
 ROTATION_CONCURRENCY = env_int("ROTATION_CONCURRENCY", 0)  # 0 = 按后端自适应
 ROTATION_BATCH_SIZE = max(1, env_int("ROTATION_BATCH_SIZE", 100))
+# 改密后是否用新密码重连一次验证。
+# 默认开启：驱动报"命令成功"但密码其实没换的情况真实存在（连错实例、
+# 账号权限不足却未报错），没有这一步就无法确认轮换真的生效。
+ROTATION_VERIFY_AFTER_CHANGE = env_bool("ROTATION_VERIFY_AFTER_CHANGE", True)
 
 # --- 目标库连接（控制台）----------------------------------------------------
 # 连目标库的超时。与 PROBE_TIMEOUT_SECONDS 分开口径：

@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from apps.assets.models import Cluster, Department, Instance
+from apps.credentials.crypto import encrypt_secret
 
 pytestmark = pytest.mark.django_db
 
@@ -31,6 +32,8 @@ def seeded():
         host="10.0.0.1",
         port=3306,
         username="app",
+        # 真实改密要先用旧密码登录目标库，因此台账里的实例必须是"已登记密码"的
+        password_ciphertext=encrypt_secret("Old@Passw0rd01"),
     )
     return {"dept": dept, "cluster": cluster, "instance": instance}
 
@@ -734,3 +737,238 @@ def test_console_exec_passes_username_to_audit(api_client, seeded, monkeypatch):
     api_client.post(f"/console/{seeded['instance'].id}/exec/", {"sql": "SELECT 1"})
 
     assert captured["user"] == "tester"
+
+
+# ---------------------------------------------------------------------------
+# 定时轮换管理页面
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_policy_page_renders(api_client, seeded):
+    resp = api_client.get("/rotation/")
+
+    assert resp.status_code == 200
+    body = resp.content.decode()
+    assert "定时轮换" in body
+    # 三类可调项都要出现在页面上：时间、范围、强度
+    assert 'name="schedule_mode"' in body
+    assert 'name="interval_hours"' in body
+    assert 'name="password_length"' in body
+    assert 'name="clusters"' in body
+    assert 'name="instances"' in body
+
+
+def test_rotation_policy_saves_interval_and_strength(api_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    resp = api_client.post(
+        "/rotation/",
+        data={
+            "enabled": "on",
+            "schedule_mode": "interval",
+            "interval_hours": 5,
+            "daily_times": "00:00,12:00",
+            "password_length": 16,
+            "clusters": [seeded["cluster"].id],
+        },
+    )
+
+    assert resp.status_code == 302
+    policy = RotationPolicy.load()
+    assert policy.interval_hours == 5
+    assert policy.password_length == 16
+    assert list(policy.clusters.values_list("id", flat=True)) == [seeded["cluster"].id]
+
+
+def test_rotation_policy_saves_daily_times(api_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    resp = api_client.post(
+        "/rotation/",
+        data={
+            "enabled": "on",
+            "schedule_mode": "daily",
+            "interval_hours": 12,
+            "daily_times": " 06:30 , 18:30 ",
+            "password_length": 24,
+        },
+    )
+
+    assert resp.status_code == 302
+    policy = RotationPolicy.load()
+    assert policy.schedule_mode == "daily"
+    # 归一化：去掉空格、按时间升序、零填充
+    assert policy.daily_times == "06:30,18:30"
+
+
+def test_rotation_policy_rejects_bad_daily_time(api_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    resp = api_client.post(
+        "/rotation/",
+        data={
+            "enabled": "on",
+            "schedule_mode": "daily",
+            "interval_hours": 12,
+            "daily_times": "25:00",
+            "password_length": 32,
+        },
+    )
+
+    assert resp.status_code == 200, "校验失败应当回显表单而不是重定向"
+    assert "超出范围" in resp.content.decode()
+    assert RotationPolicy.load().daily_times == "00:00,12:00", "非法输入不应落库"
+
+
+def test_rotation_policy_rejects_out_of_range_interval(api_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    resp = api_client.post(
+        "/rotation/",
+        data={
+            "enabled": "on",
+            "schedule_mode": "interval",
+            "interval_hours": 999,
+            "password_length": 32,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert RotationPolicy.load().interval_hours == 12
+
+
+def test_rotation_policy_run_now_executes_once(api_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    instance = seeded["instance"]
+    assert instance.password_version == 0
+
+    resp = api_client.post("/rotation/run/")
+
+    assert resp.status_code == 302
+    instance.refresh_from_db()
+    assert instance.password_version == 1
+
+    policy = RotationPolicy.load()
+    assert policy.last_run_at is not None
+    assert "成功 1" in policy.last_run_summary
+
+
+def test_rotation_policy_run_now_requires_login(anon_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    resp = anon_client.post("/rotation/run/")
+
+    assert resp.status_code == 302
+    assert "/admin/login/" in resp["Location"]
+    assert RotationPolicy.load().last_run_at is None
+    seeded["instance"].refresh_from_db()
+    assert seeded["instance"].password_version == 0
+
+
+def test_rotation_policy_save_requires_login(anon_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    resp = anon_client.post(
+        "/rotation/", data={"schedule_mode": "interval", "interval_hours": 1}
+    )
+
+    assert resp.status_code == 302
+    assert RotationPolicy.load().interval_hours == 12
+
+
+def test_detail_page_shows_policy_schedule(api_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    policy = RotationPolicy.load()
+    policy.interval_hours = 6
+    policy.save()
+
+    body = api_client.get(f"/instances/{seeded['instance'].id}/").content.decode()
+
+    assert "每 6 小时" in body
+    assert "每 12 小时" not in body, "不能残留写死的旧周期"
+
+
+def test_detail_page_marks_instance_outside_scope(api_client, seeded):
+    from apps.credentials.models import RotationPolicy
+
+    other_cluster = Cluster.objects.create(
+        name="other-cluster",
+        department=seeded["dept"],
+        engine=Cluster.Engine.MYSQL,
+        env=Cluster.Env.DEV,
+    )
+    policy = RotationPolicy.load()
+    policy.clusters.set([other_cluster])
+    policy.save()
+
+    body = api_client.get(f"/instances/{seeded['instance'].id}/").content.decode()
+
+    assert "在本次轮换范围之外" in body
+
+
+# ---------------------------------------------------------------------------
+# 详情页快速连接（右侧可折叠终端面板）
+# ---------------------------------------------------------------------------
+
+
+def test_detail_page_has_quick_connect_button(api_client, seeded):
+    """详情页要有快速连接入口，且带上实例 id 供面板切换目标。"""
+    instance = seeded["instance"]
+
+    body = api_client.get(f"/instances/{instance.id}/").content.decode()
+
+    assert 'id="quick-connect"' in body
+    assert f'data-instance-id="{instance.id}"' in body
+
+
+def test_detail_page_quick_connect_disabled_until_verified(api_client, seeded):
+    """默认是置灰的：没验证过凭据之前不允许连接。"""
+    body = api_client.get(f"/instances/{seeded['instance'].id}/").content.decode()
+
+    start = body.index('id="quick-connect"')
+    tag = body[start:start + 400]
+    assert "disabled" in tag
+
+
+def test_quick_console_drawer_present_on_every_page(api_client, seeded):
+    """抽屉骨架挂在 base.html 上，任何页面都能唤起。"""
+    for path in ["/", "/instances/", f"/instances/{seeded['instance'].id}/", "/rotation/"]:
+        body = api_client.get(path).content.decode()
+        assert 'id="qc-drawer"' in body, path
+        assert 'id="qc-handle"' in body, path
+        assert "js/quick_console.js" in body, path
+
+
+def test_quick_console_script_exists_and_reuses_endpoints():
+    """静态脚本要真的存在，且复用既有端点而不是另造执行通道。
+
+    这里直接读文件而不是走 HTTP：``python manage.py test`` / pytest 的
+    Client 不挂 StaticFilesHandler（那是 runserver 才有的），请求 /static/
+    永远 404，用它对静态资源做断言只会得到一个假阴性。
+    """
+    from pathlib import Path
+
+    from django.conf import settings
+
+    path = Path(settings.BASE_DIR) / "static" / "js" / "quick_console.js"
+    assert path.exists(), "缺少 static/js/quick_console.js"
+
+    body = path.read_text(encoding="utf-8")
+    assert "QuickConsole" in body
+    assert "/console/switch.json" in body
+    assert "/exec/" in body
+    # 危险语句的二次确认口径必须与全屏控制台一致
+    assert "confirm_required" in body
+
+
+def test_detail_page_quick_connect_requires_active_instance(api_client, seeded):
+    """停用实例的按钮不能被 PSA 放开：data-active 交给前端判定。"""
+    instance = seeded["instance"]
+    instance.is_active = False
+    instance.save(update_fields=["is_active"])
+
+    body = api_client.get(f"/instances/{instance.id}/").content.decode()
+
+    assert 'data-active="0"' in body

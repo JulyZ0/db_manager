@@ -22,6 +22,8 @@
          class="{% if active_nav == 'clusters' %}active{% endif %}">集群管理</a>
       <a href="{% url 'web:instance_list' %}"
          class="{% if active_nav == 'instances' %}active{% endif %}">实例管理</a>
+      <a href="{% url 'web:rotation_policy' %}"
+         class="{% if active_nav == 'rotation' %}active{% endif %}">定时轮换</a>
       <a href="{% url 'web:stats' %}"
          class="{% if active_nav == 'stats' %}active{% endif %}">数量统计</a>
       <a href="{% url 'web:slow_requests' %}"
@@ -45,5 +47,33 @@
     {% block content %}{% endblock %}
   </main>
 </div>
+
+{# 快速连接抽屉：任何页面都能通过 window.QuickConsole.open(...) 唤起。 #}
+{# 默认不出现在视口里，折叠后只在右侧留一个把手，不打扰阅读。 #}
+<div class="qc-drawer" id="qc-drawer" aria-hidden="true">
+  <div class="qc-bar">
+    <span class="qc-dot r"></span>
+    <span class="qc-dot y"></span>
+    <span class="qc-dot g"></span>
+    <span class="qc-title" id="qc-title">未连接</span>
+    <button class="qc-icon-btn" type="button" id="qc-collapse" title="折叠到右侧">收起 ›</button>
+  </div>
+  <div class="qc-body" id="qc-body"></div>
+  <div class="qc-input-row">
+    <span class="qc-prompt" id="qc-prompt">db&gt;</span>
+    <input class="qc-input" id="qc-input" autocomplete="off" spellcheck="false"
+           placeholder="输入 SQL 或 help，回车执行">
+  </div>
+  <div class="qc-hint">
+    <code>help</code> 帮助 · <code>verify</code> 重新验证 · <code>clear</code> 清屏 ·
+    <code>exit</code> 收起面板
+  </div>
+</div>
+
+{# 折叠后的把手：固定在视口右边缘，点一下重新展开 #}
+<button class="qc-handle" type="button" id="qc-handle" title="打开快速连接终端">快速连接</button>
+
+{% block scripts %}{% endblock %}
+<script src="{% static 'js/quick_console.js' %}" defer></script>
 </body>
 </html>

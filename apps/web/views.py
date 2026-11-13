@@ -352,11 +352,21 @@ def instance_detail(request: HttpRequest, instance_id: int) -> HttpResponse:
     )
     rotations = PasswordRotationLog.objects.filter(instance=instance).order_by("-id")[:20]
 
+    # 详情页上"会不会被自动轮换"这句说明必须跟当前策略一致，
+    # 否则运维看到的是写死的旧周期，与实际的改密节奏对不上。
+    from apps.credentials import schedule as credential_schedule
+    from apps.credentials.models import RotationPolicy
+
+    policy = RotationPolicy.load()
+
     context = {
         "active_nav": "instances",
         "instance": instance,
         "rotations": rotations,
         "rotation_count": PasswordRotationLog.objects.filter(instance=instance).count(),
+        "rotation_policy": policy,
+        "rotation_schedule_text": credential_schedule.describe_schedule(policy),
+        "in_rotation_scope": instance.id in set(policy.resolve_instance_ids()),
     }
     return render(request, "web/instance_detail.html", context)
 
@@ -597,6 +607,80 @@ def stats_rebuild(request: HttpRequest) -> HttpResponse:
 
     messages.success(request, f"{stat_date} 的统计已重算，写入 {rows} 行")
     return redirect(f"{reverse('web:stats')}?stat_date={stat_date.isoformat()}")
+
+
+# ---------------------------------------------------------------------------
+# 定时轮换策略
+# ---------------------------------------------------------------------------
+
+
+@login_required_page
+@require_http_methods(["GET", "POST"])
+def rotation_policy(request: HttpRequest) -> HttpResponse:
+    """定时轮换策略的查看与编辑。
+
+    整个系统只有一份策略（见 RotationPolicy 的单例设计），所以这里没有
+    列表页，进来就是"编辑当前策略"。
+
+    预览（下次执行时间）只反映**已保存**的策略：表单里改了但没提交的
+    时间不该显示成"即将生效"，否则运维会对着一个并不存在的计划等待。
+    """
+    from apps.credentials import schedule as credential_schedule
+    from apps.credentials.models import RotationPolicy
+    from apps.web.forms import RotationPolicyForm
+
+    policy = RotationPolicy.load()
+
+    if request.method == "POST":
+        form = RotationPolicyForm(request.POST, instance=policy)
+        if form.is_valid():
+            form.save()
+            messages.success(request, "轮换策略已保存，下一次执行时间已按新配置重算")
+            return redirect("web:rotation_policy")
+        messages.error(request, "保存失败，请按提示修正后重试")
+    else:
+        form = RotationPolicyForm(instance=policy)
+
+    context = {
+        "active_nav": "rotation",
+        "form": form,
+        "policy": policy,
+        "schedule_text": credential_schedule.describe_schedule(policy),
+        "next_run_text": credential_schedule.describe_next_run(policy),
+        "scope_label": policy.scope_label(),
+        "scope_count": len(policy.resolve_instance_ids()),
+        "mode_interval": "interval",
+        "mode_daily": "daily",
+    }
+    return render(request, "web/rotation_policy.html", context)
+
+
+@login_required_page
+@require_POST
+def rotation_run_now(request: HttpRequest) -> HttpResponse:
+    """立即按当前策略执行一次轮换，不看时间。
+
+    与定时执行共用 ``schedule.run_now``：范围、密码长度、结果摘要完全一致，
+    只是跳过"到点没有"的判定。这样运维手动跑一次不会产出不同规格的密码。
+    """
+    from apps.credentials import schedule as credential_schedule
+
+    try:
+        result = credential_schedule.run_now()
+    except Exception as exc:  # noqa: BLE001 - 面向运维的页面要给可读提示
+        logger.exception("手动执行轮换策略失败")
+        messages.error(request, f"执行失败：{exc}")
+        return redirect("web:rotation_policy")
+
+    if result.get("ran"):
+        messages.success(
+            request,
+            f"已按策略执行：成功 {result.get('success', 0)}，"
+            f"失败 {result.get('failed', 0)}，共 {result.get('total', 0)}",
+        )
+    else:
+        messages.warning(request, f"本次没有轮换任何实例：{result.get('reason')}")
+    return redirect("web:rotation_policy")
 
 
 # ---------------------------------------------------------------------------

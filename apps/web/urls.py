@@ -64,6 +64,9 @@ urlpatterns = [
     # 统计
     path("stats/", views.stats, name="stats"),
     path("stats/rebuild/", views.stats_rebuild, name="stats_rebuild"),
+    # 定时轮换策略
+    path("rotation/", views.rotation_policy, name="rotation_policy"),
+    path("rotation/run/", views.rotation_run_now, name="rotation_run_now"),
     # 慢请求
     path("slow-requests/", views.slow_requests, name="slow_requests"),
     # 终端风格控制台

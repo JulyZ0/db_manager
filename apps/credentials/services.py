@@ -26,6 +26,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from apps.assets.models import Instance, PasswordRotationLog
+from apps.credentials.changers import PasswordChangeError, change_password
 from apps.credentials.crypto import (
     DecryptionError,
     decrypt_secret,
@@ -50,21 +51,6 @@ DEFAULT_CONCURRENCY = 4
 
 # 单个实例轮换超过这个耗时说明有问题（正常在毫秒级）
 SLOW_ROTATION_MS = 1000
-
-
-def _current_fingerprint(ciphertext: str) -> str:
-    """尽力算出旧密码的指纹。
-
-    解密失败（例如中途换过 FIELD_ENCRYPTION_KEY）不能阻断轮换——
-    把旧密码换成新密码恰恰能修复这种情况，只是旧指纹留空。
-    """
-    if not ciphertext:
-        return ""
-    try:
-        return fingerprint(decrypt_secret(ciphertext))
-    except DecryptionError:
-        logger.warning("旧密码无法解密，本次轮换不记录旧指纹（可能更换过加密密钥）")
-        return ""
 
 
 def _record_failure(
@@ -103,41 +89,76 @@ def rotate_one(
     source: RotationSource = "system",
     password_length: int | None = None,
 ) -> PasswordRotationLog:
-    """为单个实例生成并写入新密码，返回本次轮换历史记录。
+    """为单个实例生成新密码，在目标库上真正改掉，然后加密落库。
+
+    三个阶段的顺序是有讲究的：
+
+    1. **读**：短事务读出当前版本与旧明文，只用来连接目标库。
+    2. **改**：连目标库执行改密命令（网络 IO）。**不放在事务里**——
+       否则一次几秒的连接超时会把 SQLite 的写锁攥住几秒，整站写请求排队。
+    3. **落**：改密成功后才本地写新密文并递增版本号。失败则只写 failed
+       历史、**不递增版本**，避免出现"本地记录换了、目标库没换"的错位。
 
     Args:
         password_length: 新密码长度。缺省取 settings.PASSWORD_LENGTH，
             由轮换策略传入时使用策略里配置的档位。
 
     Raises:
+        PasswordChangeError: 目标库改密失败（连不上、认证失败、权限不足等）。
         RotationInProgressError: 同一实例被并发轮换（版本号已变化）。
-        其它异常原样抛出，但会先写一条 failed 历史。
+        其它异常原样抛出，但都会先写一条 failed 历史。
     """
     watch = Stopwatch(f"rotate-one:{instance.pk}")
     old_fingerprint = ""
     new_fingerprint = ""
 
     try:
-        with write_lock(), transaction.atomic():
-            # 行锁：PostgreSQL 生效，SQLite 忽略
-            locked = (
-                Instance.objects.select_for_update().filter(pk=instance.pk).first()
+        # ---- 阶段 1：读取快照（只读，尽快释放）--------------------------
+        current = (
+            Instance.objects.select_related("cluster")
+            .filter(pk=instance.pk)
+            .first()
+        )
+        if current is None:
+            raise Instance.DoesNotExist(f"实例 {instance.pk} 不存在")
+
+        base_version = current.password_version
+        if not current.password_ciphertext:
+            # 没有旧密码就没法在目标库上"改"它：MySQL/PG 的 ALTER USER
+            # 都需要先以该账号登录。此时报错，而不是拿空密码去连、
+            # 更不能本地造一个密码假装成功。
+            raise PasswordChangeError(
+                "no_password",
+                "该实例尚未登记密码，无法连接目标库改密。请先在编辑页登记当前密码",
             )
-            if locked is None:
-                raise Instance.DoesNotExist(f"实例 {instance.pk} 不存在")
 
-            base_version = locked.password_version
-            old_fingerprint = _current_fingerprint(locked.password_ciphertext)
+        try:
+            old_plaintext = decrypt_secret(current.password_ciphertext)
+            old_fingerprint = fingerprint(old_plaintext)
+        except DecryptionError:
+            # 旧密码解不开就没法连目标库改密——只能报错，不能假装成功。
+            # 这类情况通常是更换过 FIELD_ENCRYPTION_KEY。
+            raise PasswordChangeError(
+                "decrypt_failed",
+                "旧密码无法解密，无法连接目标库改密。请在编辑页重新登记密码后再轮换",
+            )
 
-            # 新密码只存在于局部变量，不写日志、不进异常消息
-            plaintext = generate_password(password_length)
-            new_fingerprint = fingerprint(plaintext)
-            ciphertext = encrypt_secret(plaintext)
+        # ---- 阶段 2：生成新密码并在目标库上改掉（无事务，纯网络 IO）-----
+        # 新密码只存在于局部变量，不写日志、不进异常消息
+        plaintext = generate_password(password_length)
+        new_fingerprint = fingerprint(plaintext)
 
+        change_password(current, old_plaintext, plaintext)
+
+        # ---- 阶段 3：本地落库（短事务 + 乐观锁）-------------------------
+        ciphertext = encrypt_secret(plaintext)
+        with write_lock(), transaction.atomic():
             now = timezone.now()
-            # 乐观锁：只有版本号仍是读到的值时才写入
+            # 乐观锁：只有版本号仍是读到的值时才写入。
+            # 走到这里目标库已经是新密码了，若版本对不上说明有另一处并发轮换，
+            # 必须显式报错让运维介入，绝不能静默覆盖。
             updated = Instance.objects.filter(
-                pk=locked.pk, password_version=base_version
+                pk=current.pk, password_version=base_version
             ).update(
                 password_ciphertext=ciphertext,
                 password_version=base_version + 1,
@@ -146,11 +167,12 @@ def rotate_one(
             )
             if not updated:
                 raise RotationInProgressError(
-                    f"实例「{locked.name}」正在被另一处轮换，请稍后重试"
+                    f"实例「{current.name}」在改密期间被另一处轮换，"
+                    "目标库密码可能已变化，请重新验证凭据"
                 )
 
             log = PasswordRotationLog.objects.create(
-                instance_id=locked.pk,
+                instance_id=current.pk,
                 old_fingerprint=old_fingerprint,
                 new_fingerprint=new_fingerprint,
                 source=source,

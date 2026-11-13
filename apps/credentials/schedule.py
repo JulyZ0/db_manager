@@ -74,7 +74,7 @@ def should_run_now(policy: RotationPolicy, *, now: datetime | None = None) -> bo
 
 
 def run_if_due(*, now: datetime | None = None) -> dict[str, object]:
-    """到点则执行一次全量轮换，否则什么都不做。
+    """到点则执行一次轮换，否则什么都不做。
 
     Returns:
         ``{"ran": bool, "reason": str, ...}``。调度器只记录日志，
@@ -88,6 +88,21 @@ def run_if_due(*, now: datetime | None = None) -> dict[str, object]:
     if not should_run_now(policy, now=now):
         return {"ran": False, "reason": "未到执行时间"}
 
+    return _execute(policy, now=now)
+
+
+def run_now(*, now: datetime | None = None) -> dict[str, object]:
+    """立刻执行一次策略，不看时间（供页面上的"立即执行"按钮用）。
+
+    与 ``run_if_due`` 的差别只在跳过到点判定：范围、强度、结果记录完全一致，
+    避免"手动跑一次"产出与定时跑出来不同规格的密码。
+    """
+    policy = RotationPolicy.load()
+    return _execute(policy, now=now)
+
+
+def _execute(policy: RotationPolicy, *, now: datetime | None = None) -> dict[str, object]:
+    """真正执行一次轮换，并记录策略的执行时间与结果摘要。"""
     from apps.credentials.services import rotate_all
 
     target_ids = policy.resolve_instance_ids()

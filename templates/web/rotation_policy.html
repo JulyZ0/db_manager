@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block title %}定时轮换 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>定时轮换</h1>
+    <div class="sub">决定密码多久换一次、换哪些实例、换多长——保存后自动生效</div>
+  </div>
+  <div class="actions">
+    <form method="post" action="{% url 'web:rotation_run_now' %}" class="inline-form"
+          onsubmit="return confirm('立即按当前策略轮换一次密码？该操作会真实改写范围内所有启用实例的密码。');">
+      {% csrf_token %}
+      <button class="btn btn-primary" type="submit">立即执行一次</button>
+    </form>
+  </div>
+</div>
+
+<div class="cards">
+  <div class="stat-card">
+    <div class="label">当前节奏</div>
+    <div class="value" style="font-size:18px">{{ schedule_text }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">下次执行</div>
+    <div class="value" style="font-size:18px">{{ next_run_text }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">影响范围</div>
+    <div class="value" style="font-size:18px">{{ scope_label }}</div>
+    <div class="hint">实际命中 {{ scope_count }} 个启用实例</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">密码长度</div>
+    <div class="value" style="font-size:18px">{{ policy.password_length }} 位</div>
+  </div>
+</div>
+
+{% if policy.last_run_at %}
+  <div class="notice">
+    上次执行：{{ policy.last_run_at|date:"Y-m-d H:i:s" }}
+    {% if policy.last_run_summary %}· {{ policy.last_run_summary }}{% endif %}
+  </div>
+{% else %}
+  <div class="notice">还没有按策略执行过。启用后，到达设定时间会自动开始。</div>
+{% endif %}
+
+<div class="card">
+  <h2>轮换设置</h2>
+  <form method="post" novalidate>
+    {% csrf_token %}
+
+    {% if form.non_field_errors %}
+      <div class="alert alert-error" style="margin-bottom:14px">
+        {% for error in form.non_field_errors %}<div>{{ error }}</div>{% endfor %}
+      </div>
+    {% endif %}
+
+    {# ---- 第一块：是否启用 + 强度 ---- #}
+    <div class="form-grid">
+      <div class="field">
+        <div class="checkbox">
+          {{ form.enabled }}
+          <label for="{{ form.enabled.id_for_label }}">{{ form.enabled.label }}</label>
+        </div>
+        {% if form.enabled.help_text %}<div class="help">{{ form.enabled.help_text }}</div>{% endif %}
+        {% for error in form.enabled.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+
+      <div class="field">
+        <label for="{{ form.password_length.id_for_label }}" class="required">
+          {{ form.password_length.label }}
+        </label>
+        {{ form.password_length }}
+        {% if form.password_length.help_text %}
+          <div class="help">{{ form.password_length.help_text }}</div>
+        {% endif %}
+        {% for error in form.password_length.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+    </div>
+
+    {# ---- 第二块：时间 ---- #}
+    <h2 style="margin-top:20px">什么时候换</h2>
+    <div class="form-grid">
+      <div class="field">
+        <label for="{{ form.schedule_mode.id_for_label }}" class="required">
+          {{ form.schedule_mode.label }}
+        </label>
+        {{ form.schedule_mode }}
+        {% for error in form.schedule_mode.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+    </div>
+
+    <div class="form-grid mode-pane" data-mode="interval">
+      <div class="field">
+        <label for="{{ form.interval_hours.id_for_label }}">每</label>
+        <div class="inline-group">
+          {{ form.interval_hours }}
+          <span class="muted">小时执行一次</span>
+        </div>
+        {% if form.interval_hours.help_text %}
+          <div class="help">{{ form.interval_hours.help_text }}</div>
+        {% endif %}
+        {% for error in form.interval_hours.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+      <div class="field">
+        <div class="help">
+          常用值：12（早晚各一次，等同题面要求）、24（每天一次）、6、4。
+          间隔从"上次执行时间"起算，不会因为重启而错位。
+        </div>
+      </div>
+    </div>
+
+    <div class="form-grid mode-pane" data-mode="daily">
+      <div class="field">
+        <label for="{{ form.daily_times.id_for_label }}">每天在</label>
+        {{ form.daily_times }}
+        {% if form.daily_times.help_text %}
+          <div class="help">{{ form.daily_times.help_text }}</div>
+        {% endif %}
+        {% for error in form.daily_times.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+      <div class="field">
+        <div class="help">
+          填 <span class="mono">00:00,12:00</span> 就是每天零点与中午各一次。
+          一天要多次就都写上，逗号分隔即可。
+        </div>
+      </div>
+    </div>
+
+    {# ---- 第三块：范围 ---- #}
+    <h2 style="margin-top:20px">换哪些实例</h2>
+    <div class="alert alert-info" style="margin-bottom:12px">
+      两块都留空 = <strong>全部启用实例</strong>。勾了集群就包含该集群下所有启用实例，
+      再勾具体实例则与集群范围取并集。停用实例始终不参与。
+    </div>
+
+    <div class="form-grid">
+      <div class="field full">
+        <label>{{ form.clusters.label }}</label>
+        <div class="pick-toolbar">
+          <button class="btn btn-sm" type="button" data-pick="all" data-target="cluster-picks">全选</button>
+          <button class="btn btn-sm" type="button" data-pick="none" data-target="cluster-picks">清空</button>
+          <span class="muted small">共 {{ form.clusters.field.queryset|length }} 个集群</span>
+        </div>
+        <div class="checkbox-list" id="cluster-picks">{{ form.clusters }}</div>
+        {% if form.clusters.help_text %}<div class="help">{{ form.clusters.help_text }}</div>{% endif %}
+        {% for error in form.clusters.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+
+      <div class="field full">
+        <label>{{ form.instances.label }}</label>
+        <div class="pick-toolbar">
+          <button class="btn btn-sm" type="button" data-pick="all" data-target="instance-picks">全选</button>
+          <button class="btn btn-sm" type="button" data-pick="none" data-target="instance-picks">清空</button>
+          <span class="muted small">共 {{ form.instances.field.queryset|length }} 个实例</span>
+        </div>
+        <div class="checkbox-list" id="instance-picks">{{ form.instances }}</div>
+        {% if form.instances.help_text %}<div class="help">{{ form.instances.help_text }}</div>{% endif %}
+        {% for error in form.instances.errors %}<div class="errors">{{ error }}</div>{% endfor %}
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">保存设置</button>
+    </div>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  // 按调度方式显示/隐藏对应的时间输入，避免运维在两个都可见的框里猜该填哪个
+  var modeSelect = document.getElementById("id_schedule_mode");
+  var panes = document.querySelectorAll(".mode-pane");
+
+  function syncPanes() {
+    var current = modeSelect ? modeSelect.value : "";
+    panes.forEach(function (pane) {
+      pane.style.display = pane.dataset.mode === current ? "" : "none";
+    });
+  }
+
+  if (modeSelect) {
+    modeSelect.addEventListener("change", syncPanes);
+    syncPanes();
+  }
+
+  // 全选 / 清空：勾选几十个实例靠手点是不现实的
+  document.querySelectorAll("[data-pick]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var box = document.getElementById(btn.dataset.target);
+      if (!box) return;
+      var on = btn.dataset.pick === "all";
+      box.querySelectorAll('input[type="checkbox"]').forEach(function (input) {
+        input.checked = on;
+      });
+    });
+  });
+})();
+</script>
+{% endblock %}

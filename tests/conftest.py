@@ -50,3 +50,26 @@ def anon_client():
     from django.test import Client
 
     return Client()
+
+
+@pytest.fixture(autouse=True)
+def stub_password_change(monkeypatch):
+    """默认不连真实数据库执行改密。
+
+    ``rotate_one`` 现在会真的连目标库跑 ALTER USER / CONFIG SET。
+    单元测试里不可能同时拉起 MySQL、PG、Redis、Mongo 四套实例，
+    因此默认把"改密"这一步换成记账，只验证轮换的编排逻辑
+    （版本号、历史、失败隔离、范围）。
+
+    真实连接与命令生成由 ``tests/test_changers.py`` 用假驱动单独覆盖；
+    想断言改密参数时直接读本夹具返回的列表。
+    """
+    calls: list[tuple[int, str, str]] = []
+
+    def fake_change(instance, old_password, new_password):
+        calls.append((instance.pk, old_password, new_password))
+
+    monkeypatch.setattr(
+        "apps.credentials.services.change_password", fake_change, raising=True
+    )
+    return calls

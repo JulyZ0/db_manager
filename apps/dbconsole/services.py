@@ -223,6 +223,16 @@ def _safe_message(exc: BaseException) -> str:
     return _ERROR_HINTS.get(code, _ERROR_HINTS[ERROR_UNKNOWN])
 
 
+def classify_error(exc: BaseException) -> str:
+    """公开的分类入口，供其它模块（如改密）复用同一套错误码。"""
+    return _classify(exc)
+
+
+def error_hint(code: str) -> str:
+    """把分类码翻成给运维看的中文说明。"""
+    return _ERROR_HINTS.get(code, _ERROR_HINTS[ERROR_UNKNOWN])
+
+
 # ---------------------------------------------------------------------------
 # 各引擎适配
 # ---------------------------------------------------------------------------

@@ -16,6 +16,12 @@
       {% csrf_token %}
       <button class="btn btn-primary" type="submit">立即探测</button>
     </form>
+    {# 快速连接：凭据验证通过后才启用，见下方脚本 #}
+    <button class="btn" type="button" id="quick-connect"
+            data-instance-id="{{ instance.id }}"
+            data-active="{{ instance.is_active|yesno:'1,0' }}"
+            disabled
+            title="正在验证账号密码…">快速连接</button>
     <form class="inline-form" method="post" action="{% url 'web:instance_rotate' instance.id %}"
           onsubmit="return confirm('确定立即轮换该实例的密码？');">
       {% csrf_token %}
@@ -50,7 +56,11 @@
     <dd>
       {% if instance.is_active %}
         启用中
-        <span class="muted small">（会参与每 12 小时的自动轮换）</span>
+        {% if in_rotation_scope %}
+          <span class="muted small">（{{ rotation_schedule_text }}自动轮换）</span>
+        {% else %}
+          <span class="muted small">（在本次轮换范围之外，不会自动改密）</span>
+        {% endif %}
       {% else %}
         已停用
         <span class="muted small">（不参与自动轮换）</span>
@@ -138,6 +148,23 @@
   var versionEl = document.getElementById("cred-version");
   var hintEl = document.getElementById("cred-hint");
   var retryBtn = document.getElementById("cred-retry");
+  var quickBtn = document.getElementById("quick-connect");
+
+  // 快速连接只在"凭据确实可用"时才放开。
+  // 置灰而不是隐藏：运维能看见这个能力存在，并通过 tooltip 知道为什么点不了，
+  // 否则会以为是页面缺功能。
+  function setQuickConnect(enabled, reason) {
+    if (!quickBtn) return;
+    var active = quickBtn.dataset.active === "1";
+    quickBtn.disabled = !enabled || !active;
+    if (!active) {
+      quickBtn.title = "实例已停用，不能连接";
+    } else if (enabled) {
+      quickBtn.title = "打开右侧终端，直接操作该实例";
+    } else {
+      quickBtn.title = reason || "账号密码未通过验证，暂时不能连接";
+    }
+  }
 
   function setBadge(cls, text) {
     stateEl.innerHTML = "";
@@ -153,17 +180,20 @@
       latencyEl.textContent = data.latency_ms == null ? "-" : data.latency_ms + " ms";
       versionEl.textContent = data.server_version || "-";
       hintEl.textContent = "目标库接受这组凭据";
+      setQuickConnect(true);
     } else {
       setBadge("badge-red", "连接失败");
       latencyEl.textContent = "-";
       versionEl.textContent = "-";
       hintEl.textContent = data.hint || data.error || "未知原因";
+      setQuickConnect(false);
     }
   }
 
   function fail() {
     setBadge("badge-gray", "验证请求失败");
     hintEl.textContent = "无法访问服务，请确认程序仍在运行";
+    setQuickConnect(false, "凭据状态未知，暂时不能连接");
   }
 
   function run() {
@@ -172,6 +202,7 @@
     versionEl.textContent = "-";
     hintEl.textContent = "-";
     retryBtn.disabled = true;
+    setQuickConnect(false, "正在验证账号密码…");
 
     fetch(card.dataset.url, { headers: { "X-Requested-With": "XMLHttpRequest" } })
       .then(function (resp) { return resp.json(); })
@@ -181,6 +212,19 @@
   }
 
   retryBtn.addEventListener("click", run);
+
+  if (quickBtn) {
+    quickBtn.addEventListener("click", function () {
+      if (quickBtn.disabled) return;
+      if (!window.QuickConsole) {
+        // 脚本没加载出来时给出可执行的兜底建议，而不是静默无反应
+        alert("终端面板未加载，请刷新页面后重试。");
+        return;
+      }
+      window.QuickConsole.open(quickBtn.dataset.instanceId);
+    });
+  }
+
   run();
 })();
 </script>
