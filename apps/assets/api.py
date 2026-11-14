@@ -39,6 +39,12 @@ from apps.assets.schemas import (
 from common.auth import django_session_auth
 from common.exceptions import ConflictError, NotFoundError
 from common.pagination import paginate_queryset
+from common.permissions import (
+    PERM_ADMIN_DELETE_CASCADE,
+    PERM_ADMIN_REBUILD_STATS,
+    PERM_OPERATE_ASSETS,
+    require_perm,
+)
 from common.search import build_search_q
 
 departments_router = Router(tags=["部门"])
@@ -239,6 +245,40 @@ def _assert_role_allowed(cluster: Cluster, role: str) -> None:
     )
 
 
+def _assert_topology_change_allowed(cluster: Cluster, topology: str) -> None:
+    """改架构前确认没有实例的角色会因此失效。
+
+    ``Instance.clean()`` 只在保存实例时校验，架构却是改在集群上的。
+    不拦这一下，把"主从"改成"单机"后库里的 slave 实例就成了非法数据，
+    而界面上只表现为拓扑图奇怪，看不出根因。
+    """
+    if topology == cluster.topology:
+        return
+
+    conflicts = cluster.incompatible_instances(topology)
+    if not conflicts:
+        return
+
+    labels = dict(Instance.Role.choices)
+    allowed = Instance.roles_for_topology(topology)
+    raise ConflictError(
+        f"该架构只允许：{'、'.join(labels[r] for r in allowed)}。"
+        f"以下实例的角色会失效："
+        f"{'、'.join(obj.name for obj, _ in conflicts[:5])}"
+        + (f" 等 {len(conflicts)} 个实例" if len(conflicts) > 5 else "")
+        + "。请先调整这些实例的角色",
+        detail={
+            "field": "topology",
+            "topology": topology,
+            "allowed_roles": list(allowed),
+            "blocking_instances": [
+                {"id": obj.id, "name": obj.name, "role": obj.role}
+                for obj, _ in conflicts[:20]
+            ],
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -271,6 +311,7 @@ def list_departments(
     "", response={201: DepartmentOut}, summary="新建部门", auth=django_session_auth
 )
 def create_department(request: HttpRequest, payload: DepartmentIn):
+    require_perm(request.user, PERM_OPERATE_ASSETS, what="维护台账")
     if Department.objects.filter(name=payload.name).exists():
         raise ConflictError(f"部门名称「{payload.name}」已存在", detail={"field": "name"})
     if payload.code and Department.objects.filter(code=payload.code).exists():
@@ -302,6 +343,7 @@ def get_department(request: HttpRequest, department_id: int):
 def update_department(
     request: HttpRequest, department_id: int, payload: DepartmentPatch
 ):
+    require_perm(request.user, PERM_OPERATE_ASSETS, what="维护台账")
     obj = _get_department(department_id)
     data = payload.model_dump(exclude_unset=True)
 
@@ -330,6 +372,7 @@ def update_department(
     auth=django_session_auth,
 )
 def delete_department(request: HttpRequest, department_id: int):
+    require_perm(request.user, PERM_ADMIN_DELETE_CASCADE, what="删除部门")
     obj = _get_department(department_id)
     cluster_count = obj.clusters.count()
     if cluster_count:
@@ -383,6 +426,7 @@ def list_clusters(
     "", response={201: ClusterOut}, summary="新建集群", auth=django_session_auth
 )
 def create_cluster(request: HttpRequest, payload: ClusterIn):
+    require_perm(request.user, PERM_OPERATE_ASSETS, what="维护台账")
     department = Department.objects.filter(id=payload.department_id).first()
     if department is None:
         raise NotFoundError(f"部门 {payload.department_id} 不存在")
@@ -441,6 +485,7 @@ def get_cluster_topology(request: HttpRequest, cluster_id: int):
     "/{cluster_id}", response=ClusterOut, summary="更新集群", auth=django_session_auth
 )
 def update_cluster(request: HttpRequest, cluster_id: int, payload: ClusterPatch):
+    require_perm(request.user, PERM_OPERATE_ASSETS, what="维护台账")
     obj = _get_cluster(cluster_id)
     data = payload.model_dump(exclude_unset=True)
 
@@ -463,6 +508,11 @@ def update_cluster(request: HttpRequest, cluster_id: int, payload: ClusterPatch)
         data["alias"] = _clean_alias(data["alias"])
         _assert_cluster_alias_free(data["alias"], exclude_id=obj.id)
 
+    # 改架构前先确认没有实例的角色会失效——这一步必须在 setattr 之前，
+    # 否则 obj.topology 已经被改掉，比较就失去意义了
+    if "topology" in data and data["topology"] is not None:
+        _assert_topology_change_allowed(obj, data["topology"])
+
     for field, value in data.items():
         setattr(obj, field, value)
     obj.save()
@@ -475,6 +525,7 @@ def update_cluster(request: HttpRequest, cluster_id: int, payload: ClusterPatch)
     "/{cluster_id}", response={204: None}, summary="删除集群", auth=django_session_auth
 )
 def delete_cluster(request: HttpRequest, cluster_id: int):
+    require_perm(request.user, PERM_ADMIN_DELETE_CASCADE, what="删除集群")
     obj = _get_cluster(cluster_id)
     instance_count = obj.instances.count()
     if instance_count:
@@ -529,6 +580,7 @@ def list_instances(
     "", response={201: InstanceOut}, summary="新建实例", auth=django_session_auth
 )
 def create_instance(request: HttpRequest, payload: InstanceIn):
+    require_perm(request.user, PERM_OPERATE_ASSETS, what="维护台账")
     cluster = Cluster.objects.select_related("department").filter(
         id=payload.cluster_id
     ).first()
@@ -589,6 +641,7 @@ def get_instance(request: HttpRequest, instance_id: int):
     "/{instance_id}", response=InstanceOut, summary="更新实例", auth=django_session_auth
 )
 def update_instance(request: HttpRequest, instance_id: int, payload: InstancePatch):
+    require_perm(request.user, PERM_OPERATE_ASSETS, what="维护台账")
     obj = _get_instance(instance_id)
     data = payload.model_dump(exclude_unset=True)
 
@@ -658,6 +711,7 @@ def update_instance(request: HttpRequest, instance_id: int, payload: InstancePat
     auth=django_session_auth,
 )
 def delete_instance(request: HttpRequest, instance_id: int):
+    require_perm(request.user, PERM_OPERATE_ASSETS, what="维护台账")
     obj = _get_instance(instance_id)
     # 轮换历史通过 FK on_delete=CASCADE 自动清理
     obj.delete()

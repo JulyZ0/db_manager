@@ -278,6 +278,37 @@ def _generate_fernet_key() -> str:
     return base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
 
 
+# 与 config/settings.py 共用同一套判定规则（common.env.secret_key_problem）。
+# launcher 在此处只负责"从 .env 文本里把值抠出来"，规则本身不复制——
+# 两处规则漂移的后果是"启动器认为合法、Django 认为非法"（用户看到报错退出）
+# 或"启动器漏修、Django 拒绝启动"，两种都很难排查。
+# common.env 只依赖标准库，因此可以在装依赖之前被 import。
+try:
+    from common.env import secret_key_problem
+except ImportError:  # 极端情况：launcher 被单独复制到别处运行
+    def secret_key_problem(value: str | None) -> str | None:  # type: ignore[misc]
+        if not value or not value.strip():
+            return "缺失"
+        return None
+
+
+def _secret_key_problem(content: str) -> str | None:
+    """返回现有 DJANGO_SECRET_KEY 的问题描述；没问题返回 None。
+
+    为什么启动器要主动修：settings.py 已经把占位密钥变成硬失败，
+    若用户是"复制 .env.example 得到 .env"，双击启动会直接报错退出。
+    面向小白运维的一键启动不该停在这里——密钥本来就该由程序生成。
+    """
+    value = None
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("DJANGO_SECRET_KEY="):
+            value = stripped[len("DJANGO_SECRET_KEY="):].strip()
+            break
+
+    return secret_key_problem(value)
+
+
 def ensure_env_file() -> int:
     if ENV_FILE.exists():
         content = ENV_FILE.read_text(encoding="utf-8")
@@ -292,6 +323,18 @@ def ensure_env_file() -> int:
             content = _replace_value(content, "FIELD_ENCRYPTION_KEY", _generate_fernet_key())
             changed = True
             info("已为现有 .env 补写加密密钥")
+
+        # 占位/过短的 SECRET_KEY 会让 settings.py 拒绝启动，这里顺手换成随机值。
+        # 换 SECRET_KEY 的代价只是已登录会话失效，不影响密文数据。
+        problem = _secret_key_problem(content)
+        if problem:
+            new_key = secrets.token_urlsafe(50)
+            if _has_key(content, "DJANGO_SECRET_KEY"):
+                content = _replace_value(content, "DJANGO_SECRET_KEY", new_key)
+            else:
+                content = content.rstrip("\n") + f"\nDJANGO_SECRET_KEY={new_key}\n"
+            changed = True
+            info(f"SECRET_KEY {problem}，已生成新的随机密钥（旧登录会话将失效）")
 
         if changed:
             ENV_FILE.write_text(content, encoding="utf-8")
@@ -341,6 +384,36 @@ def _replace_value(content: str, key: str, value: str) -> str:
         else:
             lines.append(line)
     return "\n".join(lines) + "\n"
+
+
+def _env_file_get(key: str, default: str) -> str:
+    """从 .env 文本里取一个值；缺失或为空时返回 default。
+
+    启动器在 Django 加载配置之前就要决定监听地址，因此不能直接读
+    ``django.conf.settings``（那时还没有 settings）。规则与
+    ``common.env.env`` 保持一致：真实环境变量优先，.env 只作补充。
+    """
+    if (value := os.environ.get(key)) and value.strip():
+        return value.strip()
+
+    if not ENV_FILE.is_file():
+        return default
+
+    try:
+        content = ENV_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return default
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        if name.strip() != key:
+            continue
+        value = value.strip().strip("'\"")
+        return value or default
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -429,22 +502,66 @@ def ensure_admin_account() -> int:
 # ---------------------------------------------------------------------------
 
 
-def port_available(port: int) -> bool:
+def port_available(port: int, host: str = "127.0.0.1") -> bool:
+    """端口是否可绑定。
+
+    按**实际要绑的地址**探测，而不是固定 127.0.0.1：绑 0.0.0.0 时若只看
+    回环口，可能出现"回环空闲但内网口已被占用"的误判，等到 waitress
+    启动才失败，错误信息对小白运维毫无指引。
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind(("127.0.0.1", port))
+            sock.bind((host, port))
         except OSError:
             return False
     return True
 
 
 def pick_port(preferred: int) -> int:
+    host = bind_host()
+    probe_host = "0.0.0.0" if host in {"0.0.0.0", "::"} else host
     for offset in range(PORT_SCAN_LIMIT):
         candidate = preferred + offset
-        if port_available(candidate):
+        if port_available(candidate, probe_host):
             return candidate
     return preferred
+
+
+def bind_host() -> str:
+    """监听地址：默认 127.0.0.1，可用 .env 的 APP_BIND_HOST 改成内网地址。
+
+    默认只绑回环是刻意的：这套系统持有全部生产库的口令，装在谁的机器上
+    不等于该对整张内网开放。放开监听是一个由人明确做出的决定。
+    """
+    return _env_file_get("APP_BIND_HOST", "127.0.0.1")
+
+
+def _is_loopback(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def browse_url(host: str, port: int) -> str:
+    """给「打开浏览器用」的地址。
+
+    绑 0.0.0.0 时浏览器不能访问 0.0.0.0（Windows 上会直接失败），
+    必须换成本机实际 IP 或回环地址。
+    """
+    if host in {"0.0.0.0", "::"}:
+        lan = _primary_ipv4()
+        return f"http://{lan or '127.0.0.1'}:{port}/"
+    return f"http://{host}:{port}/"
+
+
+def _primary_ipv4() -> str | None:
+    """本机出口网卡的 IPv4；离线环境返回 None。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.2)
+            probe.connect(("8.8.8.8", 80))
+            return probe.getsockname()[0]
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +570,12 @@ def pick_port(preferred: int) -> int:
 
 
 def wait_until_ready(port: int, timeout: float = 45.0) -> bool:
-    """轮询 healthz，确认服务真的能响应再打开浏览器。"""
+    """轮询 healthz，确认服务真的能响应再打开浏览器。
+
+    固定探测回环地址：服务即使绑定在内网 IP 上，同一台机器的回环口
+    通常也可达；而绑 0.0.0.0 时探测本机内网 IP 反而可能被防火墙拦。
+    这里只关心"进程是否起来了"，不关心"谁能访问"。
+    """
     deadline = time.time() + timeout
     url = f"http://127.0.0.1:{port}/healthz"
     while time.time() < deadline:
@@ -467,7 +589,8 @@ def wait_until_ready(port: int, timeout: float = 45.0) -> bool:
 
 
 def serve(port: int, open_browser: bool) -> int:
-    url = f"http://127.0.0.1:{port}/"
+    host = bind_host()
+    url = browse_url(host, port)
     # 用 waitress 而不是 runserver：
     # - runserver 只有 DEBUG=True 时才服务 /static/，生产下页面会丢样式与脚本；
     # - runserver 是开发服务器，单进程单线程、无并发保护。
@@ -476,7 +599,7 @@ def serve(port: int, open_browser: bool) -> int:
         sys.executable,
         "-m",
         "waitress",
-        f"--listen=127.0.0.1:{port}",
+        f"--listen={host}:{port}",
         # 控制台执行语句可能连目标库数秒，线程数留足避免互相阻塞
         "--threads=8",
         # 探测/轮换页面的单次请求上限略高于后端 5 秒预算
@@ -488,6 +611,14 @@ def serve(port: int, open_browser: bool) -> int:
     print("  数据库实例管理系统已启动", flush=True)
     print(f"  界面地址：{url}", flush=True)
     print(f"  接口文档：{url}api/v1/docs", flush=True)
+    print(f"  监听地址：{host}:{port}", flush=True)
+    if not _is_loopback(host):
+        # 放开监听后要提醒一次：口令台账从此对内网可达，
+        # 靠的是登录鉴权而不是网络隔离。
+        print(
+            "  注意：已对其它机器开放访问，请确认已修改默认管理员口令",
+            flush=True,
+        )
     print("  关闭窗口或按 Ctrl+C 即可停止服务", flush=True)
     print("=" * 58 + "\n", flush=True)
 

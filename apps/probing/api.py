@@ -18,6 +18,7 @@ from apps.assets.models import Instance
 from apps.probing.services import probe_tcp
 from common.auth import django_session_auth
 from common.exceptions import NotFoundError
+from common.permissions import PERM_OPERATE_ASSETS, require_perm
 
 router = Router(tags=["探测"])
 
@@ -40,6 +41,7 @@ class ProbeOut(Schema):
     auth=django_session_auth,
 )
 def probe_instance(request: HttpRequest, instance_id: int):
+    require_perm(request.user, PERM_OPERATE_ASSETS, what="探测实例")
     instance = Instance.objects.filter(id=instance_id).first()
     if instance is None:
         raise NotFoundError(f"实例 {instance_id} 不存在")

@@ -407,7 +407,13 @@ class TestInstanceCRUD:
         )
         assert resp.json()["password_version"] == 1
 
-    def test_delete_cascades_rotation_logs(self, api_client, cluster):
+    def test_delete_keeps_rotation_logs(self, api_client, cluster):
+        """删除实例不能连带删除轮换历史。
+
+        轮换历史是"这台实例的密码被改过几次、成功还是失败"的唯一记录，
+        而删除实例恰恰是最需要留痕的操作——级联删掉审计等于把事故现场
+        一起清理干净。因此改为 SET_NULL + 名称快照，日志保留可追溯。
+        """
         created = api_client.post(
             "/api/v1/instances",
             data=self._payload(cluster["id"]),
@@ -422,8 +428,12 @@ class TestInstanceCRUD:
         assert PasswordRotationLog.objects.count() == 1
 
         assert api_client.delete(f"/api/v1/instances/{created['id']}").status_code == 204
-        assert PasswordRotationLog.objects.count() == 0
         assert not Instance.objects.filter(id=created["id"]).exists()
+
+        # 日志仍在，且外键被置空
+        assert PasswordRotationLog.objects.count() == 1
+        log = PasswordRotationLog.objects.get()
+        assert log.instance_id is None
 
     def test_list_never_exposes_ciphertext(self, api_client, cluster, monkeypatch):
         from apps.credentials import crypto

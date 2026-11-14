@@ -9,6 +9,11 @@ db.sqlite3
 .venv/
 venv/
 .pytest_cache/
+# pytest 的 tmp_path 根目录。默认落在系统临时目录下，但当 TMPDIR 指向项目
+# 目录（某些 Windows 环境会这样）时会在仓库里堆出 pytest-of-<user>/，
+# 里面是每次测试的临时文件，不该进版本库。
+pytest-of-*/
+.pytest_tmp/
 .coverage
 htmlcov/
 *.log

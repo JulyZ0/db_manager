@@ -126,7 +126,7 @@
         {% for log in recent_rotations %}
           <tr>
             <td class="nowrap">{{ log.created_at|date:"Y-m-d H:i:s" }}</td>
-            <td>{{ log.instance.name }}</td>
+            <td>{{ log.instance_label|default:log.instance.name|default:"（已删除的实例）" }}</td>
             <td>{{ log.get_source_display }}</td>
             <td>
               {% if log.status == "success" %}

@@ -52,5 +52,17 @@ class ConflictError(BusinessError):
     code = "CONFLICT"
 
 
+class PermissionDeniedError(BusinessError):
+    """已登录但角色权限不足。
+
+    与 401 严格区分：401 是"不知道你是谁"（需要登录），
+    403 是"知道你是谁，但你不能做这件事"（需要找管理员分配角色）。
+    混用会让用户白跑一趟——登录了仍然被拒，却不知道是权限问题。
+    """
+
+    status_code = 403
+    code = "PERMISSION_DENIED"
+
+
 class RotationInProgressError(ConflictError):
     code = "ROTATION_IN_PROGRESS"

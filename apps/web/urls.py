@@ -13,6 +13,8 @@ app_name = "web"
 
 urlpatterns = [
     path("", views.dashboard, name="dashboard"),
+    # 账号：默认口令强制改密的落点，也在侧栏里可直接进入
+    path("account/password/", views.password_change, name="password_change"),
     # 部门
     path("departments/", views.department_list, name="department_list"),
     path("departments/new/", views.department_create, name="department_create"),

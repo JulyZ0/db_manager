@@ -77,6 +77,8 @@ def _record_failure(
     try:
         PasswordRotationLog.objects.create(
             instance_id=instance.pk,
+            # 名称快照：实例删除后 FK 置空，这行文字是唯一的定位线索
+            instance_label=f"{instance.name} ({instance.host}:{instance.port})"[:200],
             old_fingerprint=old_fingerprint[:32],
             new_fingerprint=new_fingerprint[:32],
             source=source,
@@ -178,6 +180,8 @@ def rotate_one(
 
             log = PasswordRotationLog.objects.create(
                 instance_id=current.pk,
+                # 名称快照：实例删除后 FK 置空，这行文字是唯一的定位线索
+                instance_label=f"{current.name} ({current.host}:{current.port})"[:200],
                 old_fingerprint=old_fingerprint,
                 new_fingerprint=new_fingerprint,
                 source=source,

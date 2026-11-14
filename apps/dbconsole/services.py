@@ -61,6 +61,16 @@ ERROR_UNKNOWN = "unknown"
 # 而不是让运维以为语句写错了、反复重试。
 ERROR_CREDENTIAL_CHANGE = "credential_change_blocked"
 
+# 在控制台里新建带口令的账号。与上面的"改口令"分开一个码：
+# 后果不同（台账里凭空少一个账号 vs 某账号的口令对不上），
+# 运维该采取的动作也不同，混在一个码里会给出错误指引。
+ERROR_CREDENTIAL_CREATE = "credential_create_blocked"
+
+# 改名或删除账号。与"改口令"不同的失效方式：口令本身没变，但台账里
+# 登记的**账号标识**在目标库已经不存在（删号）或换成了另一个名字（改名），
+# 之后的凭据验证与自动轮换都会身份认证失败，而台账上完全看不出原因。
+ERROR_CREDENTIAL_IDENTITY = "credential_identity_blocked"
+
 # 给运维看的中文说明。刻意不含任何来自驱动/目标的原始文本。
 _ERROR_HINTS = {
     ERROR_AUTH_FAILED: "账号或密码不正确",
@@ -76,6 +86,17 @@ _ERROR_HINTS = {
     ERROR_CREDENTIAL_CHANGE: (
         "控制台不允许直接修改目标库口令，否则本地密码台账会与目标库不一致。"
         "请改用实例详情页的「立即轮换」"
+    ),
+    ERROR_CREDENTIAL_CREATE: (
+        "控制台不允许新建带口令的账号：这类账号不会进入本系统的密码台账，"
+        "之后既无法自动轮换，也无法在控制台里验证与使用。"
+        "请先在实例详情页登记该账号，再于控制台授权"
+    ),
+    ERROR_CREDENTIAL_IDENTITY: (
+        "控制台不允许给账号改名或删除账号：本系统的密码台账按账号标识登记，"
+        "改名或删号之后台账会与目标库失去对应关系，"
+        "凭据验证和自动轮换都会持续失败且看不出原因。"
+        "需要变更账号请先在实例详情页更新登记信息"
     ),
     ERROR_UNKNOWN: "未知错误",
 }
@@ -894,6 +915,97 @@ _REDIS_CREDENTIAL_CHANGE_PATTERNS = (
     re.compile(r"\bacl\s+setuser\b", re.IGNORECASE),
 )
 
+# 在目标库**新建**带口令的账号。
+#
+# 为什么也要拦
+# ------------
+# 与"改口令"不同的失效方式：改口令会让台账里的密文过期，而新建账号是
+# 台账里**根本没有这个账号**。两者都让"密码台账是目标库口令的唯一真相"
+# 这个前提失效：
+#
+#   1. 这个账号不会被自动轮换（轮换只遍历台账里的实例）；
+#   2. 控制台里无法用它登录（没有登记就没有密文可解）；
+#   3. 最坏情况下它是一个长期不变的静态口令账号，而没人知道它存在。
+#
+# 只匹配**带口令**的建号语句：``CREATE USER app2``（不带 IDENTIFIED BY）
+# 不改变任何口令，正常授权场景应当放行。
+_CREDENTIAL_CREATE_PATTERNS = (
+    # MySQL: CREATE USER 'u'@'%' IDENTIFIED BY 'p' / IDENTIFIED WITH ...
+    re.compile(
+        r"\bcreate\s+user\b.*\bidentified\s+(?:by|with)\b", re.IGNORECASE | re.DOTALL
+    ),
+    # PostgreSQL: CREATE USER/ROLE x [WITH] LOGIN PASSWORD 'p'
+    re.compile(
+        r"\bcreate\s+(?:user|role)\b.*\b(?:encrypted\s+)?password\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+)
+
+
+# 改名或删除账号。口令本身没变，改变的是**台账用来定位账号的标识**。
+#
+# 为什么不与"改口令"合并
+# ---------------------
+# ``changes_credentials`` 判的是"这个账号的口令变了"，而改名/删号之后
+# 目标库里已经找不到台账登记的那个账号（或被换成了别的名字）。两种失效
+# 表现相似（都是 auth_failed），但运维该改的地方不同：前者要重新登记口令，
+# 后者要修正账号名或重建账号，因此给独立的错误码。
+#
+# 刻意**不**匹配 ``DROP DATABASE`` / ``DROP TABLE``：那些是数据破坏，
+# 由 ``is_destructive`` 要求二次确认，与凭据台账无关，不该给出"去改账号"
+# 的错误指引。
+_CREDENTIAL_IDENTITY_PATTERNS = (
+    # MySQL 5.7+ / PostgreSQL: RENAME USER a TO b
+    re.compile(r"\brename\s+user\b", re.IGNORECASE),
+    # PostgreSQL: ALTER ROLE|USER x RENAME TO y
+    re.compile(
+        r"\balter\s+(?:role|user)\b.*\brename\s+to\b", re.IGNORECASE | re.DOTALL
+    ),
+    # MySQL: DROP USER [IF EXISTS] 'u'@'%'
+    re.compile(r"\bdrop\s+user\b", re.IGNORECASE),
+    # MySQL 8: DROP ROLE r（角色也参与身份认证）；PostgreSQL: DROP ROLE x
+    re.compile(r"\bdrop\s+role\b", re.IGNORECASE),
+)
+
+# Redis 侧的账号身份变更：ACL DELUSER 删账号、ACL SETUSER 改名需要先删后建。
+# SETUSER 已在改口令的规则里覆盖。
+_REDIS_CREDENTIAL_IDENTITY_PATTERNS = (
+    re.compile(r"\bacl\s+deluser\b", re.IGNORECASE),
+)
+
+
+def deletes_credentials(sql: str, engine: str) -> bool:
+    """判断语句是否会给账号改名或删除账号。
+
+    与 ``changes_credentials`` / ``creates_credentials`` 并列：三者分别对应
+    "台账里的口令过期"、"台账里少一个账号"、"台账里的账号标识失效"。
+    """
+    if engine == "redis":
+        return any(p.search(sql) for p in _REDIS_CREDENTIAL_IDENTITY_PATTERNS)
+
+    text = _normalize_sql(sql)
+    if not text:
+        return False
+    return any(p.search(text) for p in _CREDENTIAL_IDENTITY_PATTERNS)
+
+
+def creates_credentials(sql: str, engine: str) -> bool:
+    """判断语句是否会在目标库新建一个带口令的账号。
+
+    与 ``changes_credentials`` 分开判定：一个改既有账号的口令（台账过期），
+    一个凭空造出台账外的账号（台账缺失），运维要采取的动作不同。
+
+    Redis 不在此列——ACL SETUSER 既建号也可能改口令，已由
+    ``_REDIS_CREDENTIAL_CHANGE_PATTERNS`` 覆盖。
+    """
+    if engine == "redis":
+        return False
+
+    text = _normalize_sql(sql)
+    if not text:
+        return False
+    return any(p.search(text) for p in _CREDENTIAL_CREATE_PATTERNS)
+
 
 def changes_credentials(sql: str, engine: str) -> bool:
     """判断语句是否会修改目标库的登录口令。
@@ -909,6 +1021,86 @@ def changes_credentials(sql: str, engine: str) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in _CREDENTIAL_CHANGE_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# 审计脱敏
+# ---------------------------------------------------------------------------
+
+# 审计表里用来替换口令的占位符。用固定串而不是 ``[REDACTED]`` 之类：
+# 短、不引入新字符集，且明显不是合法口令。
+_SECRET_MASK = "***"
+
+# 引号包裹的字面量：'x' / "x" / `x`。内部允许成对引号转义（'' 或 ""）。
+_QUOTED_LITERAL = r"(?:'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|`[^`]*`)"
+
+# SQL 侧的口令落点。分组 1 保留上下文，只把后面的字面量换掉，
+# 这样审计里仍能读出"是谁的口令被改过"，但不含口令本身。
+_SQL_REDACT_PATTERNS = (
+    # MySQL: IDENTIFIED [WITH plugin] BY 'p'
+    re.compile(
+        r"(\bidentified\s+(?:with\s+\S+\s+)?by\s+)" + _QUOTED_LITERAL,
+        re.IGNORECASE,
+    ),
+    # MySQL: SET PASSWORD [FOR u] = 'p'
+    re.compile(r"(\bset\s+password\b[^=;]*=\s*)" + _QUOTED_LITERAL, re.IGNORECASE),
+    # PostgreSQL: [ENCRYPTED] PASSWORD 'p'；也覆盖
+    # ``WHERE password = 'x'`` 这类把业务口令写进查询的情形
+    re.compile(
+        r"(\b(?:encrypted\s+)?password\s*(?:=\s*)?)" + _QUOTED_LITERAL,
+        re.IGNORECASE,
+    ),
+)
+
+# Redis 侧的口令不是引号字面量，而是裸 token。
+_REDIS_REDACT_PATTERNS = (
+    # CONFIG SET requirepass <token>
+    re.compile(r"(\bconfig\s+set\s+requirepass\s+)\S+", re.IGNORECASE),
+    # ACL SETUSER <user> ... ><password> / #<sha256>
+    re.compile(r"([<>])\S+"),
+)
+
+# 只有凭据类命令才需要在 Redis 侧脱敏：普通命令里的 ``>`` 是语法成分，
+# 无差别替换会把 ``GET key>`` 之类的可读性破坏掉。
+_REDIS_CREDENTIAL_STATEMENT = re.compile(
+    r"^\s*(?:config\s+set\s+requirepass|acl\s+setuser)\b", re.IGNORECASE
+)
+
+
+def redact_statement(sql: str, engine: str) -> str:
+    """把语句里的口令字面量替换成 ``***``，供审计落库。
+
+    为什么必须在**落库前**做
+    ------------------------
+    拦截分支（改密/建号/多语句）同样会写审计。如果直接存原文，
+    ``CREATE USER 'n'@'%' IDENTIFIED BY 'Plain1!'`` 虽然被拒绝了，
+    但明文口令已经进了审计表——"绝不在任何日志暴露明文密码"这条
+    红线就被绕过了。拦截的语义是"这条语句不生效"，不是"可以留存"。
+
+    为什么不干脆不存被拦截的语句
+    ----------------------------
+    审计的价值恰恰在于事后能看出"有人试图绕过轮换流程"。只记"被拦截 1 次"
+    而不知是哪条语句、改哪个账号，就失去了排查线索。所以保留语句、
+    抹掉口令。
+
+    脱敏是**保守的**：宁可多替换一个业务查询里的口令字面量，也不漏掉
+    真正要改的那一个。替换后语句结构与长度基本不变，可读性不受影响。
+    """
+    if not sql:
+        return ""
+
+    if engine == "redis":
+        if not _REDIS_CREDENTIAL_STATEMENT.match(sql):
+            return sql
+        text = sql
+        for pattern in _REDIS_REDACT_PATTERNS:
+            text = pattern.sub(lambda m: m.group(1) + _SECRET_MASK, text)
+        return text
+
+    text = sql
+    for pattern in _SQL_REDACT_PATTERNS:
+        text = pattern.sub(lambda m: m.group(1) + _SECRET_MASK, text)
+    return text
 
 ERROR_MULTI_STATEMENT = "multi_statement"
 
@@ -1241,6 +1433,11 @@ def record_audit(
 
     审计失败不能影响主流程：用户已经拿到了执行结果，此时再因为写日志
     失败而报错，反而让人以为语句没执行。
+
+    **口令一律脱敏后再落库**。拦截分支（改密/建号/多语句）同样走这里，
+    若不脱敏，``CREATE USER ... IDENTIFIED BY 'Plain1!'`` 虽然被拒绝了，
+    明文口令却已经留在审计表里——拦截的语义是"这条语句不生效"，不是
+    "可以留存"。先脱敏再截断：反过来会让截断把口令切成半截，仍是明文。
     """
     try:
         from apps.dbconsole.models import StatementAuditLog
@@ -1253,7 +1450,7 @@ def record_audit(
             user_label=user_label[:64],
             engine=engine[:20],
             kind=classify_statement(statement, engine),
-            statement_preview=statement[:500],
+            statement_preview=redact_statement(statement, engine)[:500],
             ok=result.ok,
             row_count=result.row_count,
             affected=result.affected,
@@ -1321,6 +1518,39 @@ def execute_statement(
             ok=False,
             error=ERROR_CREDENTIAL_CHANGE,
             message=_ERROR_HINTS[ERROR_CREDENTIAL_CHANGE],
+        )
+        record_audit(
+            instance,
+            user_label=user_label,
+            statement=statement,
+            result=result,
+        )
+        return result
+
+    # 新建带口令的账号同理：它会在台账之外造出一个既不被轮换、
+    # 也无法在控制台使用的静态口令账号。不带口令的建号（授权场景）放行。
+    if creates_credentials(statement, engine):
+        result = QueryResult(
+            ok=False,
+            error=ERROR_CREDENTIAL_CREATE,
+            message=_ERROR_HINTS[ERROR_CREDENTIAL_CREATE],
+        )
+        record_audit(
+            instance,
+            user_label=user_label,
+            statement=statement,
+            result=result,
+        )
+        return result
+
+    # 改名/删号：口令没变，但台账赖以定位账号的标识失效了。后果与改口令
+    # 同级——之后的凭据验证与自动轮换会持续 auth_failed，而台账上看不出
+    # 任何异常。同样在建连之前拒绝。
+    if deletes_credentials(statement, engine):
+        result = QueryResult(
+            ok=False,
+            error=ERROR_CREDENTIAL_IDENTITY,
+            message=_ERROR_HINTS[ERROR_CREDENTIAL_IDENTITY],
         )
         record_audit(
             instance,

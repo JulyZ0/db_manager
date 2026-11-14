@@ -44,6 +44,15 @@ class InstanceAdmin(admin.ModelAdmin):
 
 @admin.register(PasswordRotationLog)
 class PasswordRotationLogAdmin(admin.ModelAdmin):
-    list_display = ("id", "instance", "source", "status", "duration_ms", "created_at")
+    list_display = (
+        "id",
+        "instance_label",
+        "source",
+        "status",
+        "duration_ms",
+        "created_at",
+    )
     list_filter = ("source", "status")
     readonly_fields = ("created_at",)
+    # 实例被删后 FK 置空，名称快照是唯一的定位线索，因此允许按它检索
+    search_fields = ("instance_label",)

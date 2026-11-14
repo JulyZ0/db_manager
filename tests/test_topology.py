@@ -552,3 +552,111 @@ class TestClusterDetailPage:
 
         assert page_json["nodes"] == api_json["nodes"]
         assert page_json["edges"] == api_json["edges"]
+
+
+class TestTopologyChangeBackfill:
+    """改架构时，已有实例的角色必须被回溯校验。
+
+    这是「架构是集群级决策」这条规则的另一半：既然架构决定实例可担任的
+    角色，那么把架构改窄时，必须先确认没有实例的角色会因此失效。
+    否则库里会留下一批架构不允许的角色，而界面上只表现为拓扑图奇怪。
+    """
+
+    def test_model_blocks_shrinking_topology(self, topo_cluster):
+        """把主从改成单机：两个 slave 不再合法，full_clean 必须拒绝。"""
+        cluster = topo_cluster["cluster"]
+        cluster.topology = Cluster.Topology.STANDALONE
+
+        with pytest.raises(ValidationError) as exc:
+            cluster.full_clean()
+
+        errors = exc.value.message_dict
+        assert "topology" in errors
+        # 提示里要点出冲突实例的名字，用户才知道去改谁
+        assert "order-s1" in errors["topology"][0]
+
+    def test_model_allows_widening_topology(self, topo_cluster):
+        """放宽架构不该被拦：现有角色仍然合法。"""
+        cluster = topo_cluster["cluster"]
+        # 主从 → 分片：slave 在分片里同样合法
+        cluster.topology = Cluster.Topology.SHARDED
+        cluster.full_clean()  # 不抛异常即通过
+
+    def test_model_allows_same_topology(self, topo_cluster):
+        """架构没变时不该做任何回溯查询，也不该报错。"""
+        cluster = topo_cluster["cluster"]
+        cluster.full_clean()
+
+    def test_incompatible_instances_lists_conflicts(self, topo_cluster):
+        cluster = topo_cluster["cluster"]
+        conflicts = cluster.incompatible_instances(Cluster.Topology.STANDALONE)
+
+        names = {obj.name for obj, _ in conflicts}
+        # 两个 slave 冲突，master 在单机下仍然合法
+        assert names == {"order-s1", "order-s2"}
+        # 期望角色随结果一起给出，调用方不必再算一遍
+        for _obj, allowed in conflicts:
+            assert Instance.Role.SLAVE not in allowed
+
+    def test_incompatible_instances_empty_when_compatible(self, topo_cluster):
+        cluster = topo_cluster["cluster"]
+        assert cluster.incompatible_instances(Cluster.Topology.MASTER_SLAVE) == []
+
+    def test_unsaved_cluster_has_no_conflicts(self, topology_setup):
+        """新建集群还没有实例，不该去查库。"""
+        cluster = Cluster(
+            name="fresh", department=topology_setup["dept"],
+            topology=Cluster.Topology.STANDALONE,
+        )
+        assert cluster.incompatible_instances(Cluster.Topology.STANDALONE) == []
+
+    def test_api_rejects_topology_change_with_conflicts(self, api_client, topo_cluster):
+        cluster = topo_cluster["cluster"]
+        resp = api_client.patch(
+            f"/api/v1/clusters/{cluster.id}",
+            data={"topology": "standalone"},
+            content_type="application/json",
+        )
+
+        assert resp.status_code == 409
+        body = resp.json()
+        assert body["detail"]["field"] == "topology"
+        blocking = body["detail"]["blocking_instances"]
+        assert {item["name"] for item in blocking} == {"order-s1", "order-s2"}
+
+        # 架构确实没被改掉
+        cluster.refresh_from_db()
+        assert cluster.topology == Cluster.Topology.MASTER_SLAVE
+
+    def test_api_allows_topology_change_without_conflicts(self, api_client, topology_setup):
+        """集群只有一个 master 时，改成单机是合法的。"""
+        cluster = topology_setup["cluster"]  # 只有 m1（master）
+        resp = api_client.patch(
+            f"/api/v1/clusters/{cluster.id}",
+            data={"topology": "standalone"},
+            content_type="application/json",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["topology"] == "standalone"
+
+    def test_form_blocks_topology_change_with_conflicts(self, topo_cluster):
+        """页面表单走 ModelForm → full_clean，同样被拦住。"""
+        from apps.web.forms import ClusterForm
+
+        cluster = topo_cluster["cluster"]
+        form = ClusterForm(
+            data={
+                "name": cluster.name,
+                "department": cluster.department_id,
+                "engine": cluster.engine,
+                "env": cluster.env,
+                "topology": "standalone",
+                "description": "",
+                "is_active": True,
+            },
+            instance=cluster,
+        )
+
+        assert form.is_valid() is False
+        assert "topology" in form.errors

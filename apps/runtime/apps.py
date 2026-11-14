@@ -76,6 +76,11 @@ class RuntimeConfig(AppConfig):
     verbose_name = "运行期基础设施"
 
     def ready(self) -> None:
+        # 登录成功/失败的记账信号。必须无条件注册：它只在真正发生登录时
+        # 才动缓存，与调度器无关，不该跟着 should_start_scheduler() 一起跳过。
+        # 不导入就不会注册（Django 靠 import 副作用连接 receiver）。
+        from common import auth_signals  # noqa: F401
+
         if not should_start_scheduler():
             return
 

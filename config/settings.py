@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import socket
 import sys
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -16,7 +17,14 @@ from urllib.parse import unquote, urlparse
 from celery.schedules import crontab
 from django.core.exceptions import ImproperlyConfigured
 
-from common.env import env, env_bool, env_int, env_list, load_env_file
+from common.env import (
+    env,
+    env_bool,
+    env_int,
+    env_list,
+    load_env_file,
+    secret_key_problem,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -28,10 +36,55 @@ load_env_file(BASE_DIR / ".env")
 # ---------------------------------------------------------------------------
 
 SECRET_KEY = env("DJANGO_SECRET_KEY")
-if not SECRET_KEY:
+
+
+def _local_ipv4_addresses() -> list[str]:
+    """本机可访问的 IPv4 地址，用于监听内网时自动补全 ALLOWED_HOSTS。
+
+    不引入第三方库：用一个 UDP socket "连"到公网地址只为让内核选出一条
+    出口网卡，从而拿到它的本地地址（UDP 不握手，不会真的发包）。
+    在完全断网的机器上这一步会失败，此时返回空列表——宁可少补几个
+    主机名，也不要把 ``*`` 写进白名单。
+    """
+    addresses: list[str] = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.2)
+            probe.connect(("8.8.8.8", 80))
+            addresses.append(probe.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        # 主机名解析可能给出更多地址（多网卡机器）
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addresses.append(info[4][0])
+    except OSError:
+        pass
+
+    return [a for a in dict.fromkeys(addresses) if a and a != "0.0.0.0"]
+
+
+def _validate_secret_key(key: str | None) -> None:
+    """拒绝缺失、占位符、以及过短的 SECRET_KEY。
+
+    判定逻辑放在 ``common.env.secret_key_problem``：launcher.py 必须用
+    **同一套**规则判断"这个 .env 需不需要修"。两处规则一旦漂移，
+    结果就是启动器没修、或修了仍起不来。
+    """
+    problem = secret_key_problem(key)
+    if problem is None:
+        return
+
     raise ImproperlyConfigured(
-        "缺少 DJANGO_SECRET_KEY。请复制 .env.example 为 .env 并填写密钥。"
+        f"DJANGO_SECRET_KEY {problem}，拒绝启动。\n"
+        "占位值在仓库里是公开的，用它签发的 session 可以被伪造。\n"
+        '生成新值：python -c "import secrets; print(secrets.token_urlsafe(50))"\n'
+        "（双击 start.bat 启动时，启动器会自动为你生成）"
     )
+
+
+_validate_secret_key(SECRET_KEY)
 
 # 默认 False：未显式开启即按生产口径运行（不回显 traceback / SQL / 配置）。
 # 本地开发需要调试页时才在 .env 里写 DJANGO_DEBUG=True。
@@ -39,11 +92,34 @@ DEBUG = env_bool("DJANGO_DEBUG", False)
 
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
 
+# 监听地址。默认**只绑本机回环**。
+#
+# 为什么默认不是 0.0.0.0
+# ---------------------
+# 这套系统里存着全部生产库的口令（加密后），"装在哪台机器上"不等于
+# "该对整张内网开放"。默认绑回环，运维明确知道自己在做什么时才改成
+# 内网地址——风险偏好应当由人一次性决定，而不是由默认值替他决定。
+#
+# 改成 0.0.0.0 / 内网 IP 后，浏览器用的是本机 IP 或域名作为 Host 头；
+# 若不把这些地址放进 ALLOWED_HOSTS，访问会被 400 DisallowedHost 挡掉，
+# 而且报错信息对小白运维毫无指引。所以这里按绑定值自动补齐。
+BIND_HOST = (env("APP_BIND_HOST", "127.0.0.1") or "127.0.0.1").strip() or "127.0.0.1"
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+if BIND_HOST not in _LOOPBACK_HOSTS:
+    # 绑 0.0.0.0 时，真正的 Host 头是访问者的那个 IP，补 0.0.0.0 本身没用；
+    # 因此把本机可解析到的 IPv4 一并加入（仍不是 "*"，未列出的域名照样拒绝）。
+    ALLOWED_HOSTS = [*ALLOWED_HOSTS, BIND_HOST, *_local_ipv4_addresses()]
+
 # 测试进程需要 testserver；开发态放宽到任意本地绑定地址。
 # 生产（DEBUG=False 且非测试）只认显式配置的白名单，不做任何自动放宽。
 RUNNING_TESTS = "pytest" in sys.modules
 if DEBUG or RUNNING_TESTS:
     ALLOWED_HOSTS = [*ALLOWED_HOSTS, "0.0.0.0", "testserver"]
+
+# 去重但保序：重复项会让运维读 ALLOWED_HOSTS 时以为配了两遍
+ALLOWED_HOSTS = list(dict.fromkeys(ALLOWED_HOSTS))
 
 
 INSTALLED_APPS = [
@@ -77,6 +153,10 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # 必须在 AuthenticationMiddleware 之后：它要读 request.user。
+    # 默认口令未改时把页面请求导回改密页——默认口令写在仓库里，
+    # 等于人人可知的后台入口。
+    "common.force_password_change.ForcePasswordChangeMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -165,6 +245,105 @@ USE_TZ = True
 LOGIN_URL = "/admin/login/"
 LOGIN_REDIRECT_URL = "/admin/"
 LOGOUT_REDIRECT_URL = "/admin/login/"
+
+# 登录失败限流。
+#
+# 登录页是唯一的身份入口，此前没有任何失败计数：对 admin 这种固定用户名
+# 可以直接在线爆破。两层限流缺一不可——只按 IP 挡不住内网多来源，
+# 只按用户名挡不住用一份字典扫大量账号。
+#
+# 计数放在缓存里：它高频、短命、可丢弃，写数据库等于凭空多一个写热点。
+#
+# 默认 LocMemCache 是**进程内**的，waitress 单进程多线程足够。
+# 改多进程部署（gunicorn 多 worker / 多个 waitress 进程）时必须换成共享缓存：
+# 否则每个进程各记一份计数，阈值等效放大 N 倍，限流形同虚设。
+# 配 CACHE_URL=redis://... 即自动切到 Redis，无需改代码。
+_CACHE_URL = (env("CACHE_URL", "") or "").strip()
+
+if _CACHE_URL.startswith(("redis://", "rediss://", "unix://")):
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": _CACHE_URL,
+            # 缓存断了不应该让整站 500：限流计数丢失的代价远小于登录不可用
+            "OPTIONS": {"socket_connect_timeout": 2, "socket_timeout": 2},
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "db_manager-locmem",
+        }
+    }
+
+# 窗口内允许的失败次数与锁定时长（秒）。默认 5 次 / 15 分钟。
+LOGIN_MAX_FAILURES = max(1, env_int("LOGIN_MAX_FAILURES", 5))
+LOGIN_LOCKOUT_SECONDS = max(10, env_int("LOGIN_LOCKOUT_SECONDS", 900))
+
+# IP 维度阈值单独放宽到 20：内网出口常共用 IP，若与用户名阈值相同，
+# 同事 A 输错 5 次会把 B、C 一起锁在门外。IP 维度要拦的是"一份字典扫大量
+# 用户名"的撞库，那种模式会在很短时间内把计数堆到几十，20 次足够触发。
+LOGIN_MAX_FAILURES_PER_IP = max(
+    LOGIN_MAX_FAILURES, env_int("LOGIN_MAX_FAILURES_PER_IP", 20)
+)
+
+# 口令强度校验。
+#
+# Django 的 AUTH_PASSWORD_VALIDATORS 默认是**空列表**——不配置等于
+# `validate_password()` 什么都不检查，改密页会接受 "1" 这种口令。这不是
+# "默认宽松"，是"默认没有防线"，必须显式声明。
+#
+# 这套账号能操作生产库的口令台账，按 NIST SP 800-63B 的思路取舍：
+# 长度优先、不做组合强制（强制符号只会催生 "Passw0rd!" 这类可预测口令），
+# 并拦掉与账号信息相似、以及常见弱口令表里的值。
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 12},
+    },
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+# 认证后端：在标准 ModelBackend 之前做锁定检查。
+# 放在后端而不是某个登录视图里，是因为登录入口不止一个（admin、未来的
+# 自定义登录页、任何 authenticate() 调用），视图层加防护会被新入口绕过。
+AUTHENTICATION_BACKENDS = [
+    "common.auth_backends.ThrottledModelBackend",
+]
+
+# ---------------------------------------------------------------------------
+# 会话
+# ---------------------------------------------------------------------------
+#
+# 不设 SESSION_COOKIE_AGE 时 Django 默认 2 周。这对一个能改目标库密码的
+# 后台太长：运维在工位登录后没点退出，两周内任何拿到那台机器的人
+# 直接就是登录态。
+#
+# 默认 12 小时：覆盖一个完整班次，加班到深夜也不会被踢；过了就要求重新
+# 登录。注意这是**固定**过期——不是"空闲 12 小时"。之所以不做滑动续期
+# （SESSION_SAVE_EVERY_REQUEST=True），是因为那会让每个请求都写一次
+# session 表：本项目的写路径本来就要过 SQLite 写锁，为了"续期"把只读
+# 请求也变成写请求，代价不划算。需要滑动过期时用环境变量单独打开。
+SESSION_COOKIE_AGE = max(300, env_int("SESSION_COOKIE_AGE", 43200))
+SESSION_SAVE_EVERY_REQUEST = env_bool("SESSION_SAVE_EVERY_REQUEST", False)
+
+# 关闭浏览器即失效。默认关：内网工具，运维习惯让页面开着过夜；
+# 真按安全基线执行时再打开（它会覆盖 SESSION_COOKIE_AGE 的效果）。
+SESSION_EXPIRE_AT_BROWSER_CLOSE = env_bool("SESSION_EXPIRE_AT_BROWSER_CLOSE", False)
+
+# 显式声明 SameSite：Django 默认就是 Lax，但写出来才能防止以后被误改。
+# Lax 而不是 Strict——Strict 会让"从内部文档点链接进来"不带 cookie，
+# 用户会看到自己像是没登录。
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+
+# SESSION_COOKIE_HTTPONLY 不在这里设置：它属于安全基线，统一由下面的
+# `if not DEBUG:` 块强制 True。同一项散落在两处，改了一处忘了另一处时
+# 谁生效取决于语句先后顺序——本项目此前就在 TRUST_PROXY_HEADERS 上
+# 踩过同样的坑。
 
 # 必须带前导斜杠：写成 "static/" 时 {% static %} 会输出相对路径，
 # 在深层页面（如 /instances/3/）会被解析成 /instances/3/static/... 而 404，
@@ -326,6 +505,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.metrics.tasks.aggregate_daily_stats",
         "schedule": crontab(minute=0, hour=0),
     },
+    # 03:30 而非 00:00：避开统计任务与常见的备份/批量轮换窗口，
+    # 减少写锁争抢（SQLite 上尤其明显）。
+    "cleanup-expired-logs": {
+        "task": "apps.metrics.tasks.cleanup_expired_logs",
+        "schedule": crontab(minute=30, hour=3),
+    },
 }
 
 
@@ -366,6 +551,20 @@ SLOW_LOG_QUEUE_SIZE = max(1, env_int("SLOW_LOG_QUEUE_SIZE", 2000))
 SLOW_LOG_BATCH_SIZE = max(1, env_int("SLOW_LOG_BATCH_SIZE", 50))
 # 最长等待多久必须刷一次，保证慢请求记录不会长时间停在内存里
 SLOW_LOG_FLUSH_SECONDS = max(0.1, float(env_int("SLOW_LOG_FLUSH_SECONDS", 5)))
+
+# --- 运行日志的保留期 -------------------------------------------------------
+# 三张「只增不减」的表按保留期裁剪，见 apps/metrics/retention.py。
+# 置 0 表示永久保留（合规要求长期留档时使用，但列表页会随数据量变慢）。
+# 慢请求记录量最大、排障价值衰减最快，所以保留最短。
+SLOW_LOG_RETENTION_DAYS = env_int("SLOW_LOG_RETENTION_DAYS", 90)
+# 语句审计涉及「谁改了什么」，保留久一些
+AUDIT_LOG_RETENTION_DAYS = env_int("AUDIT_LOG_RETENTION_DAYS", 180)
+# 轮换历史用于追溯密码变更，保留一年
+ROTATION_LOG_RETENTION_DAYS = env_int("ROTATION_LOG_RETENTION_DAYS", 365)
+# 每批删除条数。一次 DELETE 百万行会长时间持有写锁，SQLite 上会卡死站点。
+LOG_CLEANUP_BATCH_SIZE = max(1, env_int("LOG_CLEANUP_BATCH_SIZE", 500))
+# 单次运行最多删多少批（安全阀）。宁可下次再删，也不让清理本身变成慢任务。
+LOG_CLEANUP_MAX_BATCHES = max(1, env_int("LOG_CLEANUP_MAX_BATCHES", 200))
 
 # --- 列表页模糊搜索 ---------------------------------------------------------
 # contains（默认）：LIKE '%关键词%'，语义与界面提示一致；在 PostgreSQL 上

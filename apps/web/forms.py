@@ -376,3 +376,70 @@ class RotationPolicyForm(BootstrapMixin, forms.ModelForm):
 
         return cleaned
 
+
+class ChangePasswordForm(BootstrapMixin, forms.Form):
+    """修改当前登录账号的密码。
+
+    为什么不用 Django 自带的 ``PasswordChangeForm``
+    ----------------------------------------------
+    自带的那个把校验全交给 ``AUTH_PASSWORD_VALIDATORS``，默认配置里
+    ``MinimumLengthValidator`` 只要求 8 位——对"能操作生产库口令台账"
+    的账号太松。这里保留验证器链路（便于统一调整），另加两条业务规则：
+    新密码不得与旧密码相同、两次输入必须一致。
+
+    校验顺序刻意先验旧密码：如果先报"新密码太短"，攻击者可以据此判断
+    当前密码对不对——虽然本页已要求登录，但没有必要多给一个试探口。
+    """
+
+    old_password = forms.CharField(
+        label="当前密码",
+        widget=forms.PasswordInput(attrs={"autocomplete": "current-password"}),
+        help_text="首次登录时需要填写系统给你的初始密码",
+    )
+    new_password1 = forms.CharField(
+        label="新密码",
+        widget=forms.PasswordInput(attrs={"autocomplete": "new-password"}),
+        help_text="至少 12 位，建议混合大小写字母、数字与符号",
+    )
+    new_password2 = forms.CharField(
+        label="确认新密码",
+        widget=forms.PasswordInput(attrs={"autocomplete": "new-password"}),
+        help_text="再输入一次，避免手误",
+    )
+
+    def __init__(self, user, *args, **kwargs) -> None:
+        self.user = user
+        super().__init__(*args, **kwargs)
+
+    def clean_old_password(self):
+        old_password = self.cleaned_data["old_password"]
+        if not self.user.check_password(old_password):
+            raise forms.ValidationError("当前密码不正确")
+        return old_password
+
+    def clean(self):
+        cleaned = super().clean()
+        new1 = cleaned.get("new_password1")
+        new2 = cleaned.get("new_password2")
+        old = cleaned.get("old_password")
+
+        if new1 and new2 and new1 != new2:
+            self.add_error("new_password2", "两次输入的新密码不一致")
+
+        if not new1:
+            return cleaned
+
+        if old and new1 == old:
+            self.add_error("new_password1", "新密码不能与当前密码相同")
+            return cleaned
+
+        from django.contrib.auth.password_validation import validate_password
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        try:
+            validate_password(new1, self.user)
+        except DjangoValidationError as exc:
+            self.add_error("new_password1", exc)
+
+        return cleaned
+

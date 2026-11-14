@@ -23,9 +23,24 @@ from django.views.decorators.http import require_http_methods, require_POST
 from apps.assets.models import Cluster, Department, Instance, PasswordRotationLog
 from apps.metrics.models import DailyInstanceStat, SlowRequestLog
 from apps.web.decorators import login_required_page
-from apps.web.forms import ClusterForm, DepartmentForm, InstanceForm
+from apps.web.forms import (
+    ChangePasswordForm,
+    ClusterForm,
+    DepartmentForm,
+    InstanceForm,
+)
 from common import scheduler as scheduler_mod
 from common.pagination import DEFAULT_PAGE_SIZE, paginate_queryset
+from common.permissions import (
+    PERM_ADMIN_BULK_ROTATE,
+    PERM_ADMIN_CONSOLE,
+    PERM_ADMIN_DELETE_CASCADE,
+    PERM_ADMIN_REBUILD_STATS,
+    PERM_OPERATE_ASSETS,
+    deny_page_if_no_perm,
+    has_perm,
+    permission_required_page,
+)
 from common.request import actor_label, client_ip
 from common.search import build_search_q
 
@@ -136,6 +151,7 @@ def department_list(request: HttpRequest) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="维护台账")
 @require_http_methods(["GET", "POST"])
 def department_create(request: HttpRequest) -> HttpResponse:
     if request.method == "POST":
@@ -156,6 +172,7 @@ def department_create(request: HttpRequest) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="维护台账")
 @require_http_methods(["GET", "POST"])
 def department_edit(request: HttpRequest, department_id: int) -> HttpResponse:
     dept = get_object_or_404(Department, id=department_id)
@@ -177,6 +194,7 @@ def department_edit(request: HttpRequest, department_id: int) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_ADMIN_DELETE_CASCADE, what="删除部门")
 @require_POST
 def department_delete(request: HttpRequest, department_id: int) -> HttpResponse:
     dept = get_object_or_404(Department, id=department_id)
@@ -235,6 +253,7 @@ def cluster_list(request: HttpRequest) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="维护台账")
 @require_http_methods(["GET", "POST"])
 def cluster_create(request: HttpRequest) -> HttpResponse:
     if request.method == "POST":
@@ -259,6 +278,7 @@ def cluster_create(request: HttpRequest) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="维护台账")
 @require_http_methods(["GET", "POST"])
 def cluster_edit(request: HttpRequest, cluster_id: int) -> HttpResponse:
     cluster = get_object_or_404(Cluster, id=cluster_id)
@@ -320,6 +340,7 @@ def cluster_topology(request: HttpRequest, cluster_id: int) -> JsonResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="复制关系编排")
 @require_http_methods(["GET", "POST"])
 def cluster_replication(request: HttpRequest, cluster_id: int) -> HttpResponse:
     """集群级复制关系编排。
@@ -374,6 +395,7 @@ def cluster_replication(request: HttpRequest, cluster_id: int) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="复制关系编排")
 @require_POST
 def cluster_replication_auto(request: HttpRequest, cluster_id: int) -> HttpResponse:
     """按当前架构一键生成复制关系。"""
@@ -395,6 +417,7 @@ def cluster_replication_auto(request: HttpRequest, cluster_id: int) -> HttpRespo
 
 
 @login_required_page
+@permission_required_page(PERM_ADMIN_DELETE_CASCADE, what="删除集群")
 @require_POST
 def cluster_delete(request: HttpRequest, cluster_id: int) -> HttpResponse:
     cluster = get_object_or_404(Cluster, id=cluster_id)
@@ -542,6 +565,7 @@ def instance_verify_credentials(request: HttpRequest, instance_id: int) -> JsonR
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="维护台账")
 @require_http_methods(["GET", "POST"])
 def instance_create(request: HttpRequest) -> HttpResponse:
     if request.method == "POST":
@@ -574,6 +598,7 @@ def instance_create(request: HttpRequest) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="维护台账")
 @require_http_methods(["GET", "POST"])
 def instance_edit(request: HttpRequest, instance_id: int) -> HttpResponse:
     instance = get_object_or_404(Instance, id=instance_id)
@@ -603,6 +628,7 @@ def instance_edit(request: HttpRequest, instance_id: int) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="维护台账")
 @require_POST
 def instance_delete(request: HttpRequest, instance_id: int) -> HttpResponse:
     instance = get_object_or_404(Instance, id=instance_id)
@@ -613,6 +639,7 @@ def instance_delete(request: HttpRequest, instance_id: int) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="探测实例")
 @require_POST
 def instance_probe(request: HttpRequest, instance_id: int) -> HttpResponse:
     """页面上的"探测"按钮：探测完回到原页面并提示结果。"""
@@ -653,6 +680,7 @@ def instance_probe(request: HttpRequest, instance_id: int) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_OPERATE_ASSETS, what="轮换实例密码")
 @require_POST
 def instance_rotate(request: HttpRequest, instance_id: int) -> HttpResponse:
     """页面上的"立即轮换密码"按钮。"""
@@ -724,6 +752,7 @@ def stats(request: HttpRequest) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_ADMIN_REBUILD_STATS, what="重算统计")
 @require_POST
 def stats_rebuild(request: HttpRequest) -> HttpResponse:
     """重算指定日期（缺省今天）的统计快照。"""
@@ -762,6 +791,15 @@ def rotation_policy(request: HttpRequest) -> HttpResponse:
     from apps.credentials.models import RotationPolicy
     from apps.web.forms import RotationPolicyForm
 
+    # 只读用户可以查看当前策略（知道系统什么时候会改密码，本身就是重要信息），
+    # 但只有管理员能改。所以不在视图上挂装饰器，而是只拦 POST。
+    if request.method == "POST":
+        denied = deny_page_if_no_perm(
+            request, PERM_ADMIN_BULK_ROTATE, what="修改轮换策略"
+        )
+        if denied is not None:
+            return denied
+
     policy = RotationPolicy.load()
 
     if request.method == "POST":
@@ -789,6 +827,7 @@ def rotation_policy(request: HttpRequest) -> HttpResponse:
 
 
 @login_required_page
+@permission_required_page(PERM_ADMIN_BULK_ROTATE, what="立即执行批量轮换")
 @require_POST
 def rotation_run_now(request: HttpRequest) -> HttpResponse:
     """立即按当前策略执行一次轮换，不看时间。
@@ -814,6 +853,54 @@ def rotation_run_now(request: HttpRequest) -> HttpResponse:
     else:
         messages.warning(request, f"本次没有轮换任何实例：{result.get('reason')}")
     return redirect("web:rotation_policy")
+
+
+# ---------------------------------------------------------------------------
+# 账号
+# ---------------------------------------------------------------------------
+
+
+@login_required_page
+@require_http_methods(["GET", "POST"])
+def password_change(request: HttpRequest) -> HttpResponse:
+    """修改当前登录账号的密码。
+
+    ``login_required_page`` 是必须的：这个页面直接改凭据。它的跳转目标
+    是 ``/admin/login/``，且中间件已把本页放进白名单，所以不会与
+    "默认口令强制改密"形成回环。
+    """
+    from django.contrib.auth import update_session_auth_hash
+
+    from apps.web.models import is_using_default_password
+
+    forced = is_using_default_password(request.user)
+
+    if request.method == "POST":
+        form = ChangePasswordForm(request.user, request.POST)
+        if form.is_valid():
+            request.user.set_password(form.cleaned_data["new_password1"])
+            request.user.save()
+            # 不更新 session 里的认证哈希，改完密码立刻被踢回登录页——
+            # 用户会以为"改密失败"，实际上只是会话失效。
+            update_session_auth_hash(request, request.user)
+            logger.info(
+                "账号 %s 修改密码成功 ip=%s", request.user.get_username(), client_ip(request)
+            )
+            messages.success(request, "密码已更新，请牢记新密码。")
+            return redirect("web:dashboard")
+        messages.error(request, "密码未修改，请检查标红项")
+    else:
+        form = ChangePasswordForm(request.user)
+
+    return render(
+        request,
+        "web/password_change.html",
+        {
+            "form": form,
+            "active_nav": "",
+            "forced": forced,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -865,7 +952,14 @@ def console(request: HttpRequest) -> HttpResponse:
 @login_required_page
 @require_POST
 def console_exec(request: HttpRequest, instance_id: int) -> JsonResponse:
-    """控制台执行一条语句。要求登录，且需 CSRF（django 中间件默认校验）。"""
+    """控制台执行一条语句。要求登录，且需 CSRF（django 中间件默认校验）。
+
+    权限：需要 ``admin_console``。这是把目标库的登录凭据借给操作者用，
+    影响面远超"改一台机器的台账"，所以不随操作员权限发放。
+
+    这里返回 JSON 而不是重定向：调用方是 fetch，重定向会被当成 200 的
+    一段 HTML 塞进终端，用户看到的是"执行了但没输出"，查不出是被拒。
+    """
     from apps.dbconsole.services import (
         ERROR_MULTI_STATEMENT,
         check_statement,
@@ -874,6 +968,16 @@ def console_exec(request: HttpRequest, instance_id: int) -> JsonResponse:
         execute_statement,
         is_destructive,
     )
+
+    if not has_perm(request.user, PERM_ADMIN_CONSOLE):
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "permission_denied",
+                "hint": "当前账号没有「在控制台执行语句」权限，请联系管理员分配角色",
+            },
+            status=403,
+        )
 
     instance = get_object_or_404(
         Instance.objects.select_related("cluster"), id=instance_id

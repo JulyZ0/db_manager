@@ -61,6 +61,7 @@ class Command(BaseCommand):
             user.is_staff = True
             user.is_superuser = True
             user.save()
+            _watch_default_password(user, password)
             self.stdout.write(
                 self.style.SUCCESS(f"已创建管理员账号：{username}")
             )
@@ -77,6 +78,7 @@ class Command(BaseCommand):
         if reset:
             user.set_password(password)
             changed.append("password")
+            _watch_default_password(user, password)
 
         if changed:
             user.save()
@@ -87,3 +89,20 @@ class Command(BaseCommand):
             )
         else:
             self.stdout.write(f"管理员账号 {username} 已存在，无需改动")
+
+
+def _watch_default_password(user, password: str) -> None:
+    """若这次设置的就是默认口令，登记它的哈希以便首登时强制改密。
+
+    为什么判断"是不是默认口令"而不是无条件登记
+    -----------------------------------------
+    运维若通过 ``ADMIN_PASSWORD`` 或 ``--password`` 指定了自己的口令，
+    那已经不是公开信息，没有理由再强制他改一次——每次重置完就被再拦一次，
+    只会让人以为系统坏了。
+    """
+    if password != DEFAULT_PASSWORD:
+        return
+
+    from apps.web.models import mark_default_password
+
+    mark_default_password(user)

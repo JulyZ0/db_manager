@@ -777,3 +777,72 @@ class TestAggregate:
         assert DailyInstanceStat.objects.get(stat_date=day).cluster_name == (
             "renamed-cluster"
         )
+
+
+# ---------------------------------------------------------------------------
+# 轮换历史的留存：删实例不能删审计
+# ---------------------------------------------------------------------------
+
+
+class TestRotationLogRetention:
+    """轮换历史必须独立于实例存在。
+
+    删实例是最需要留痕的操作。这里固定三件事：外键在删实例后置空、
+    名称快照已经写下、快照足以在没有 FK 时定位到当时的实例。
+    """
+
+    def test_log_writes_instance_label_snapshot(self, cluster):
+        from apps.credentials.services import rotate_one
+
+        inst = make_instance(cluster, name="snap-01", host="10.8.0.1", port=3307)
+        log = rotate_one(inst)
+
+        assert log.instance_label == "snap-01 (10.8.0.1:3307)"
+
+    def test_log_survives_instance_deletion(self, cluster):
+        from apps.credentials.services import rotate_one
+
+        inst = make_instance(cluster, name="keep-01", host="10.8.0.2")
+        rotate_one(inst)
+        inst_id = inst.pk
+
+        inst.delete()
+
+        log = PasswordRotationLog.objects.get()
+        assert log.instance_id is None
+        # 快照还在，仍能回答"当时是哪个实例"
+        assert "keep-01" in log.instance_label
+        assert PasswordRotationLog.objects.filter(instance_id=inst_id).count() == 0
+
+    def test_failure_log_survives_instance_deletion(self, cluster, monkeypatch):
+        """失败记录同样要保留——它比成功记录更有排查价值。"""
+        from apps.credentials import services as cred_services
+
+        def boom(instance, old, new):
+            raise RuntimeError("target refused")
+
+        monkeypatch.setattr(cred_services, "change_password", boom)
+
+        inst = make_instance(cluster, name="fail-01", host="10.8.0.3")
+        with pytest.raises(Exception):
+            cred_services.rotate_one(inst)
+
+        log = PasswordRotationLog.objects.get()
+        assert log.status == PasswordRotationLog.Status.FAILED
+        assert log.instance_label == "fail-01 (10.8.0.3:3306)"
+
+        inst.delete()
+        log.refresh_from_db()
+        assert log.instance_id is None
+        assert "fail-01" in log.instance_label
+
+    def test_label_never_contains_secret(self, cluster):
+        """快照只能放 name/host/port，绝不能顺手带上密文或明文。"""
+        from apps.credentials.services import rotate_one
+
+        inst = make_instance(cluster, name="sec-01", host="10.8.0.4")
+        log = rotate_one(inst)
+
+        assert "v1:" not in log.instance_label
+        assert log.old_fingerprint not in log.instance_label
+        assert log.new_fingerprint not in log.instance_label

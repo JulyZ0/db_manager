@@ -129,10 +129,86 @@ class Cluster(TimeStampedModel):
     def __str__(self) -> str:
         return f"{self.department.name}/{self.name}"
 
+    def incompatible_instances(self, topology: str | None = None) -> list[tuple]:
+        """列出在新架构下角色不再合法的实例。
+
+        为什么需要这个方法
+        ------------------
+        ``Instance.clean()`` 只在**保存实例时**校验角色与架构是否自洽。
+        但架构是改在集群上的：把"主从"改成"单机"后，原来那些 slave
+        实例不会被重新校验，数据库里就留下一批架构不允许的角色。
+        后果是拓扑图上出现不可能存在的节点、角色下拉显示成非法值，
+        而界面上看不出是架构改过——排查时会误以为是数据损坏。
+
+        这里不自动纠正角色：静默改用户数据比留下不一致更危险。
+        调用方（表单 / API）应当阻断保存并把冲突实例列给用户看。
+
+        Args:
+            topology: 待校验的架构；默认取当前实例上的值。
+
+        Returns:
+            ``[(instance, allowed_roles), ...]``；空列表表示全部合法。
+        """
+        target = topology or self.topology
+        allowed = Instance.roles_for_topology(target)
+        if not self.pk:
+            return []
+
+        rows = self.instances.exclude(role__in=allowed).only("id", "name", "role")
+        return [(obj, allowed) for obj in rows]
+
     def save(self, *args, **kwargs):
         # 空串会互相冲突（NULL 不会），所以"没填别名"必须统一存 NULL
         self.alias = normalize_alias(self.alias)
         super().save(*args, **kwargs)
+
+    def clean(self):
+        """改架构时挡住"会让已有实例角色失效"的保存。
+
+        放在模型层而不是表单层：管理后台、API、页面三条写入路径都要生效。
+        ModelForm 会自动调用 full_clean()，因此 admin 里的修改同样被拦住。
+
+        错误挂到 ``topology`` 字段上（而非 __all__），页面上会标在架构
+        下拉旁边，用户一眼知道该改哪里。
+
+        为什么不自动纠正角色：静默改用户数据比留下可见的不一致更危险——
+        运维会以为系统"自己处理好了"，实际拓扑已经和他声明的不一样。
+        """
+        super().clean()
+
+        if not self.pk or not self.topology:
+            return
+
+        # 必须和库里的旧值比较：self.topology 此时已是新值
+        previous = (
+            type(self)
+            .objects.filter(pk=self.pk)
+            .values_list("topology", flat=True)
+            .first()
+        )
+        if previous is None or previous == self.topology:
+            return
+
+        conflicts = self.incompatible_instances(self.topology)
+        if not conflicts:
+            return
+
+        labels = dict(Instance.Role.choices)
+        allowed = Instance.roles_for_topology(self.topology)
+        names = "、".join(
+            f"{obj.name}（{labels.get(obj.role, obj.role)}）" for obj, _ in conflicts[:5]
+        )
+        if len(conflicts) > 5:
+            names += f" 等 {len(conflicts)} 个实例"
+        raise ValidationError(
+            {
+                "topology": (
+                    f"该架构只允许：{'、'.join(labels[r] for r in allowed)}。"
+                    f"以下实例的角色会失效：{names}。"
+                    "请先在实例页面调整它们的角色，再修改架构。"
+                )
+            }
+        )
 
 
 class Instance(TimeStampedModel):
@@ -273,6 +349,19 @@ class Instance(TimeStampedModel):
         verbose_name = "实例"
         verbose_name_plural = "实例"
         ordering = ["id"]
+        # 自定义权限点。Django 会为每个权限创建一条 Permission 记录，
+        # admin 后台可以直接把它勾给用户或组。
+        #
+        # 为什么不散落到各 app 的模型上：这些权限点全部围绕"对实例做什么"，
+        # 挂在 Instance 上最直观，也让权限下拉列表里只出现有意义的一个来源。
+        # codename 与 common/permissions.py 里的常量必须逐字一致。
+        permissions = [
+            ("operate_assets", "可维护台账（增删改部门/集群/实例、探测、单实例轮换）"),
+            ("admin_console", "可在控制台对目标库执行任意 SQL"),
+            ("admin_bulk_rotate", "可批量轮换密码与修改轮换策略"),
+            ("admin_rebuild_stats", "可重算每日统计快照"),
+            ("admin_delete_cascade", "可删除集群与部门（连带影响其下实例）"),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["cluster", "host", "port"],
@@ -311,9 +400,20 @@ class PasswordRotationLog(models.Model):
 
     instance = models.ForeignKey(
         Instance,
-        on_delete=models.CASCADE,
+        # SET_NULL 而不是 CASCADE：轮换历史是"这台实例的密码被改过几次、
+        # 成功还是失败"的唯一记录。删除实例恰恰是最需要留痕的操作，
+        # 连带删掉审计等于把事故现场一起清理干净了。
+        # 与 StatementAuditLog 采用同一范式（项目内已有先例）。
+        on_delete=models.SET_NULL,
         related_name="rotation_logs",
         verbose_name="实例",
+        null=True,
+        blank=True,
+    )
+    # 名称快照：实例删除后 FK 变 NULL，若不留名字就只剩一串无意义的日志，
+    # 读不出"当时是哪个实例"。与 metrics 侧的 department_name/cluster_name 同理。
+    instance_label = models.CharField(
+        "实例名称快照", max_length=200, blank=True, default=""
     )
     old_fingerprint = models.CharField("旧密码指纹", max_length=32, blank=True, default="")
     new_fingerprint = models.CharField("新密码指纹", max_length=32, blank=True, default="")

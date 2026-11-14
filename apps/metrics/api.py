@@ -10,6 +10,7 @@ from ninja import Query, Router, Schema
 from apps.metrics.models import DailyInstanceStat
 from apps.metrics.services import aggregate_for_date
 from common.auth import django_session_auth
+from common.permissions import PERM_ADMIN_REBUILD_STATS, require_perm
 
 router = Router(tags=["统计"])
 
@@ -74,5 +75,6 @@ def get_daily_stats(
     auth=django_session_auth,
 )
 def rebuild_daily_stats(request: HttpRequest, stat_date: date = Query(...)):
+    require_perm(request.user, PERM_ADMIN_REBUILD_STATS, what="重算统计")
     rows_written = aggregate_for_date(stat_date)
     return RebuildOut(stat_date=stat_date, rows_written=rows_written)

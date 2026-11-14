@@ -458,6 +458,105 @@ def test_credential_change_blocked_keeps_local_ciphertext(make_instance):
     assert (instance.password_ciphertext, instance.password_version) == before
 
 
+@pytest.mark.parametrize(
+    "sql,engine",
+    [
+        ("ALTER USER 'app'@'%' IDENTIFIED BY 'Leak1!'", "mysql"),
+        (
+            "CREATE USER 'n'@'%' IDENTIFIED WITH mysql_native_password BY 'Leak1!'",
+            "mysql",
+        ),
+        ("SET PASSWORD FOR 'app'@'%' = 'Leak1!'", "mysql"),
+        ("GRANT ALL ON d.* TO 'app'@'%' IDENTIFIED BY 'Leak1!'", "mysql"),
+        ("ALTER ROLE app WITH PASSWORD 'Leak1!'", "postgresql"),
+        ("CREATE ROLE n WITH LOGIN PASSWORD 'Leak1!'", "postgresql"),
+        ("SELECT * FROM t WHERE password = 'Leak1!'", "postgresql"),
+        ("CONFIG SET requirepass Leak1!", "redis"),
+        ("ACL SETUSER bob on >Leak1! ~* +@all", "redis"),
+    ],
+)
+def test_redact_statement_masks_secrets(sql, engine):
+    """口令字面量必须被替换，且不残留任何片段。"""
+    redacted = services.redact_statement(sql, engine)
+
+    assert "Leak1!" not in redacted
+    assert "***" in redacted
+    # 替换的是口令，不是整条语句：上下文要留着，否则审计失去排查价值
+    assert redacted != "***"
+
+
+@pytest.mark.parametrize(
+    "sql,engine",
+    [
+        ("SELECT * FROM orders WHERE id = 1", "mysql"),
+        ("SELECT user, host FROM mysql.user", "mysql"),
+        ("CREATE USER app2", "mysql"),
+        ("GET somekey", "redis"),
+        ("CONFIG GET requirepass", "redis"),
+    ],
+)
+def test_redact_statement_leaves_normal_sql_untouched(sql, engine):
+    """普通语句不脱敏——否则审计可读性会被无谓破坏。"""
+    assert services.redact_statement(sql, engine) == sql
+
+
+def test_blocked_credential_change_audit_has_no_plaintext(make_instance, monkeypatch):
+    """拦截分支同样写审计，但明文口令绝不能进库。"""
+    from apps.dbconsole.models import StatementAuditLog
+
+    def should_not_run(instance, password, sql, timeout):
+        raise AssertionError("改密语句不应发起连接")
+
+    monkeypatch.setitem(services._EXECUTORS, "mysql", should_not_run)
+    instance = make_instance()
+
+    services.execute_statement(
+        instance, "ALTER USER 'app'@'%' IDENTIFIED BY 'Leak1!'", user_label="admin"
+    )
+
+    log = StatementAuditLog.objects.get(instance=instance)
+    assert "Leak1!" not in log.statement_preview
+    assert "ALTER USER" in log.statement_preview
+    assert "***" in log.statement_preview
+
+
+def test_blocked_create_user_audit_has_no_plaintext(make_instance, monkeypatch):
+    """建号拦截分支同理：拒绝了语句，不等于可以留存它的口令。"""
+    from apps.dbconsole.models import StatementAuditLog
+
+    def should_not_run(instance, password, sql, timeout):
+        raise AssertionError("建号语句不应发起连接")
+
+    monkeypatch.setitem(services._EXECUTORS, "mysql", should_not_run)
+    instance = make_instance()
+
+    services.execute_statement(
+        instance, "CREATE USER 'n'@'%' IDENTIFIED BY 'Leak1!'", user_label="admin"
+    )
+
+    log = StatementAuditLog.objects.get(instance=instance)
+    assert "Leak1!" not in log.statement_preview
+    assert "CREATE USER" in log.statement_preview
+
+
+def test_executed_statement_audit_has_no_plaintext(make_instance, monkeypatch):
+    """放行并执行的语句也要脱敏：审计里不能有口令，哪怕它执行成功了。"""
+    from apps.dbconsole.models import StatementAuditLog
+
+    def fake_exec(instance, password, sql, timeout):
+        return services.QueryResult(ok=True, affected=1)
+
+    monkeypatch.setitem(services._EXECUTORS, "mysql", fake_exec)
+    instance = make_instance()
+
+    services.execute_statement(
+        instance, "SELECT * FROM t WHERE password = 'Leak1!'", user_label="admin"
+    )
+
+    log = StatementAuditLog.objects.get(instance=instance)
+    assert "Leak1!" not in log.statement_preview
+
+
 def test_execute_writes_audit_on_success(make_instance, monkeypatch):
     from apps.dbconsole.models import StatementAuditLog
 
@@ -794,3 +893,208 @@ def test_postgres_statement_timeout_scales_with_timeout(make_instance, monkeypat
     services.execute_statement(instance, "SELECT 1", timeout=5)
 
     assert captured["connect"]["options"] == "-c statement_timeout=5000"
+
+
+# ---------------------------------------------------------------------------
+# 新建带口令账号同样绕过密码台账
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql,engine",
+    [
+        ("CREATE USER 'n'@'%' IDENTIFIED BY 'p'", "mysql"),
+        ("create user n identified with mysql_native_password by 'p'", "mysql"),
+        ("CREATE USER n IDENTIFIED BY 'p'", "mysql"),
+        ("CREATE ROLE r2 WITH LOGIN PASSWORD 'p'", "postgresql"),
+        ("CREATE USER r3 PASSWORD 'p'", "postgresql"),
+        ("/*!50000 CREATE USER 'n'@'%' IDENTIFIED BY 'p'*/", "mysql"),
+    ],
+)
+def test_creates_credentials_detected(sql, engine):
+    assert services.creates_credentials(sql, engine) is True
+
+
+@pytest.mark.parametrize(
+    "sql,engine",
+    [
+        # 不带口令的建号是正常授权场景，不该拦
+        ("CREATE USER app2", "mysql"),
+        ("CREATE USER app3@'%'", "mysql"),
+        ("CREATE ROLE readonly", "postgresql"),
+        ("SELECT 1", "postgresql"),
+        ("GRANT SELECT ON *.* TO 'app'@'%'", "mysql"),
+        ("GET foo", "redis"),
+    ],
+)
+def test_creates_credentials_not_false_positive(sql, engine):
+    assert services.creates_credentials(sql, engine) is False
+
+
+def test_creates_credentials_ignores_redis():
+    """Redis 的 ACL SETUSER 走改密通道，不算"新建账号"。"""
+    assert services.creates_credentials("ACL SETUSER app >p", "redis") is False
+
+
+def test_execute_blocks_credential_create_before_connecting(
+    make_instance, monkeypatch
+):
+    from apps.dbconsole.models import StatementAuditLog
+
+    def should_not_run(instance, password, sql, timeout):
+        raise AssertionError("新建带口令账号不应发起连接")
+
+    monkeypatch.setitem(services._EXECUTORS, "mysql", should_not_run)
+    instance = make_instance()
+
+    result = services.execute_statement(instance, "CREATE USER 'n'@'%' IDENTIFIED BY 'p'")
+
+    assert result.ok is False
+    assert result.error == services.ERROR_CREDENTIAL_CREATE
+    # 指引要说清"为什么"和"怎么做"，否则运维只会换个写法硬试
+    assert "台账" in result.hint
+    assert StatementAuditLog.objects.filter(instance=instance).count() == 1
+
+
+def test_execute_allows_plain_create_user(make_instance, monkeypatch):
+    """不带口令的建号必须照常执行——否则正常授权会被误伤。"""
+    captured: dict = {}
+
+    def fake_exec(instance, password, sql, timeout):
+        captured["sql"] = sql
+        return services.QueryResult(ok=True)
+
+    monkeypatch.setitem(services._EXECUTORS, "mysql", fake_exec)
+    instance = make_instance()
+
+    result = services.execute_statement(instance, "CREATE USER app2")
+
+    assert result.ok is True
+    assert captured["sql"] == "CREATE USER app2"
+
+
+def test_credential_create_keeps_local_ciphertext(make_instance):
+    """拦截后本地密文与版本号必须原样不动。"""
+    instance = make_instance()
+    before = (instance.password_ciphertext, instance.password_version)
+
+    services.execute_statement(instance, "CREATE USER 'n'@'%' IDENTIFIED BY 'p'")
+
+    instance.refresh_from_db()
+    assert (instance.password_ciphertext, instance.password_version) == before
+
+
+def test_credential_create_distinct_from_change(make_instance, monkeypatch):
+    """两个错误码不能混用：运维要采取的动作不同。"""
+    monkeypatch.setitem(services._EXECUTORS, "mysql", lambda *a: services.QueryResult(ok=True))
+    instance = make_instance()
+
+    change = services.execute_statement(instance, "ALTER USER 'a'@'%' IDENTIFIED BY 'p'")
+    create = services.execute_statement(instance, "CREATE USER 'b'@'%' IDENTIFIED BY 'p'")
+
+    assert change.error == services.ERROR_CREDENTIAL_CHANGE
+    assert create.error == services.ERROR_CREDENTIAL_CREATE
+    assert change.error != create.error
+
+
+# ---------------------------------------------------------------------------
+# 改名 / 删号
+# ---------------------------------------------------------------------------
+#
+# 口令没变，改变的是"台账靠什么找到这个账号"。这类语句此前完全放行：
+# 执行成功后目标库的账号已经不叫台账里那个名字（或已不存在），
+# 之后每一次凭据验证、每一次自动轮换都会 auth_failed，而台账上看不出原因。
+
+
+@pytest.mark.parametrize(
+    "sql,engine",
+    [
+        ("RENAME USER 'app'@'%' TO 'app2'@'%'", "mysql"),
+        ("rename user app to app2", "mysql"),
+        ("ALTER ROLE app RENAME TO app2", "postgresql"),
+        ("ALTER USER app RENAME TO app2", "postgresql"),
+        ("DROP USER 'app'@'%'", "mysql"),
+        ("DROP USER IF EXISTS 'app'@'%'", "mysql"),
+        ("DROP ROLE app", "postgresql"),
+        ("DROP USER app", "postgresql"),
+        # 可执行注释不能成为绕过路径，与改密/建号保持一致的展开口径
+        ("/*!50000 RENAME USER 'app'@'%' TO 'x'@'%'*/", "mysql"),
+        ("ACL DELUSER app", "redis"),
+    ],
+)
+def test_deletes_credentials_detected(sql, engine):
+    assert services.deletes_credentials(sql, engine) is True
+
+
+@pytest.mark.parametrize(
+    "sql,engine",
+    [
+        # 数据破坏，与凭据台账无关：交给 is_destructive 要求二次确认，
+        # 不该给出"去修账号"的错误指引
+        ("DROP TABLE t", "mysql"),
+        ("DROP DATABASE d", "postgresql"),
+        ("TRUNCATE TABLE t", "mysql"),
+        ("DELETE FROM t WHERE id = 1", "mysql"),
+        # 正常的权限调整不该拦
+        ("GRANT SELECT ON *.* TO 'app'@'%'", "mysql"),
+        ("REVOKE ALL ON *.* FROM 'app'@'%'", "mysql"),
+        ("CREATE USER app2", "mysql"),
+        ("SELECT user, host FROM mysql.user", "mysql"),
+        ("GET foo", "redis"),
+        ("ACL LIST", "redis"),
+    ],
+)
+def test_deletes_credentials_not_false_positive(sql, engine):
+    assert services.deletes_credentials(sql, engine) is False
+
+
+def test_execute_blocks_credential_rename_before_connecting(
+    make_instance, monkeypatch
+):
+    """拒绝必须发生在建连之前：连上去执行成功，坏状态就已经产生了。"""
+    from apps.dbconsole.models import StatementAuditLog
+
+    def should_not_run(instance, password, sql, timeout):
+        raise AssertionError("改名/删号语句不应发起连接")
+
+    monkeypatch.setitem(services._EXECUTORS, "mysql", should_not_run)
+    instance = make_instance()
+
+    result = services.execute_statement(instance, "RENAME USER 'app'@'%' TO 'x'@'%'")
+
+    assert result.ok is False
+    assert result.error == services.ERROR_CREDENTIAL_IDENTITY
+    # 审计要留痕，但不得含明文口令（本语句没有口令，这里守的是不回归）
+    log = StatementAuditLog.objects.get(instance=instance)
+    assert log.ok is False
+
+
+def test_credential_rename_keeps_local_ciphertext(make_instance):
+    """拦截后本地密文与版本号必须原样不动。"""
+    instance = make_instance()
+    before = (instance.password_ciphertext, instance.password_version)
+
+    services.execute_statement(instance, "DROP USER 'app'@'%'")
+
+    instance.refresh_from_db()
+    assert (instance.password_ciphertext, instance.password_version) == before
+
+
+def test_credential_identity_distinct_from_other_codes(make_instance, monkeypatch):
+    """三个错误码不能混用：各自的补救动作不同。"""
+    monkeypatch.setitem(
+        services._EXECUTORS, "mysql", lambda *a: services.QueryResult(ok=True)
+    )
+    instance = make_instance()
+
+    change = services.execute_statement(instance, "ALTER USER 'a'@'%' IDENTIFIED BY 'p'")
+    create = services.execute_statement(instance, "CREATE USER 'b'@'%' IDENTIFIED BY 'p'")
+    identity = services.execute_statement(instance, "DROP USER 'c'@'%'")
+
+    codes = {
+        services.ERROR_CREDENTIAL_CHANGE,
+        services.ERROR_CREDENTIAL_CREATE,
+        services.ERROR_CREDENTIAL_IDENTITY,
+    }
+    assert {change.error, create.error, identity.error} == codes
+

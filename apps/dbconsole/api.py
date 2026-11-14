@@ -28,6 +28,7 @@ from apps.dbconsole.services import (
 )
 from common.auth import django_session_auth
 from common.exceptions import ConflictError, NotFoundError, ValidationFailedError
+from common.permissions import PERM_ADMIN_CONSOLE, require_perm
 
 router = Router(tags=["连接控制台"])
 
@@ -113,7 +114,9 @@ def execute_on_instance(request: HttpRequest, instance_id: int, payload: Execute
     2. 一次只允许一条语句，``SELECT 1; DROP TABLE x`` 这类会在建连前被拦。
     3. 破坏性语句需 ``confirm=true``，否则返回 409 让调用方二次确认。
     4. 每次尝试都写审计，审计内容含操作人与语句前 500 字符。
+    5. 需要 ``admin_console`` 权限：这等于把目标库凭据借给调用方使用。
     """
+    require_perm(request.user, PERM_ADMIN_CONSOLE, what="在控制台执行语句")
     instance = _get_instance(instance_id)
 
     sql = (payload.sql or "").strip()

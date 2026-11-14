@@ -58,3 +58,35 @@ def aggregate_daily_stats(self) -> dict[str, object]:
     )
 
     return {"rows": rows, "duration_ms": elapsed_ms}
+
+
+@shared_task(
+    bind=True,
+    name="apps.metrics.tasks.cleanup_expired_logs",
+    autoretry_for=(Exception,),
+    retry_backoff=120,
+    retry_backoff_max=600,
+    max_retries=2,
+    acks_late=True,
+)
+def cleanup_expired_logs(self) -> dict[str, object]:
+    """每天深夜按保留期清理三张日志表。
+
+    放在 03:30 而不是 00:00：00:00 已经有统计任务，且午夜前后常有
+    备份、批量轮换等作业，错开可以避免写锁争抢。
+
+    清理逻辑在 apps/metrics/retention.py，本函数只做 Celery 包装。
+    单表失败不会冒泡到这里（retention 内部已消化），因此重试只针对
+    整体性故障（连接不可用等）。
+    """
+    from apps.metrics.retention import cleanup_expired_logs as run_cleanup
+
+    logger.info("开始清理过期运行日志")
+    result = run_cleanup()
+
+    logger.info(
+        "日志清理完成：共删除 %s 条，耗时 %sms",
+        result.get("total_deleted", 0),
+        result.get("duration_ms", 0),
+    )
+    return result
