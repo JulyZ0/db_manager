@@ -510,6 +510,81 @@ body.qc-open .main { padding-right: 548px; }
 }
 .topo-fallback { padding: 12px 0; }
 
+/* 趋势图：容器必须有确定宽度，SVG 才能按 clientWidth 计算坐标 */
+.trend-chart {
+  width: 100%;
+  min-height: 120px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fbfcfd;
+  padding: 8px;
+  box-sizing: border-box;
+}
+.trend-chart svg { display: block; }
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 6px 4px 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.chart-legend i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+.chart-empty {
+  padding: 24px 8px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* 指标网格：集群概览里每个实例的核心指标块。
+   auto-fill + minmax 让窄屏自动降列数，不需要写断点。 */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.metric-cell {
+  background: #fbfcfd;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.metric-label { color: var(--muted); font-size: 12px; }
+.metric-value {
+  font-size: 18px;
+  font-weight: 600;
+  margin-top: 2px;
+  /* 数值宽度不一时也能对齐，避免跳动 */
+  font-variant-numeric: tabular-nums;
+}
+.metric-value small { font-size: 11px; font-weight: 400; color: var(--muted); }
+
+/* 占比条：cluster_space 里表示单库占总量的比例 */
+.bar {
+  display: inline-block;
+  width: 120px;
+  height: 6px;
+  background: var(--gray-bg);
+  border-radius: 3px;
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+.bar > span {
+  display: block;
+  height: 100%;
+  background: var(--primary);
+}
+
 @media (max-width: 720px) {
   .topo-canvas { height: 340px; }
 }

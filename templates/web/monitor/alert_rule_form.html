@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{% if is_edit %}编辑告警规则{% else %}新增告警规则{% endif %} · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{% if is_edit %}编辑告警规则{% else %}新增告警规则{% endif %}</h1>
+    <div class="sub">
+      阈值评估随采集周期运行；单点毛刺不算事件，可设置「持续时长」要求越界保持一段时间
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{% url 'web:alert_rules' %}">返回规则列表</a>
+  </div>
+</div>
+
+<div class="card">
+  <form method="post" novalidate>
+    {% csrf_token %}
+    {% include "web/_form_fields.html" with form=form %}
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">{% if is_edit %}保存修改{% else %}创建规则{% endif %}</button>
+      <a class="btn" href="{% url 'web:alert_rules' %}">取消</a>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>配置提示</h2>
+  <dl class="kv">
+    <dt>阈值的单位</dt>
+    <dd>
+      与指标本身一致：使用率类填百分比数值（80 表示 80%），
+      字节类填字节数，速率类填每秒次数。
+    </dd>
+    <dt>持续时长</dt>
+    <dd>
+      填 0 表示一旦越界立即告警，适合"必须马上知道"的指标；
+      填 5 表示需连续越界满 5 分钟，适合容易抖动的指标（连接数、CPU）。
+    </dd>
+    <dt>冷却时间</dt>
+    <dd>
+      告警恢复后这段时间内不再重复告警。阈值附近来回抖动时，
+      冷却能避免几十条重复事件把人吵到关掉告警。
+    </dd>
+    <dt>连不上目标库</dt>
+    <dd>
+      这类问题不走阈值规则：采集失败本身在「监控大盘」的
+      「需要关注的实例」里直接列出，并带错误码。
+    </dd>
+  </dl>
+</div>
+{% endblock %}

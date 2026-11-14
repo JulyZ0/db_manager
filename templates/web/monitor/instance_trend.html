@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ instance.name }} · 性能趋势{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ instance.name }} · 性能趋势</h1>
+    <div class="sub">
+      {{ instance.cluster.name }} · {{ instance.cluster.get_engine_display }}
+      · <span class="mono">{{ instance.host }}:{{ instance.port }}</span>
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{% url 'web:instance_realtime' instance.id %}">实时性能</a>
+    <a class="btn" href="{% url 'web:instance_detail' instance.id %}">实例详情</a>
+  </div>
+</div>
+
+{% if not specs %}
+  <div class="card">
+    <div class="alert alert-warning">
+      「{{ instance.cluster.get_engine_display }}」引擎暂不支持趋势采集。
+    </div>
+  </div>
+{% else %}
+  <div class="card">
+    <form method="get" class="filters">
+      <div class="field">
+        <label for="hours">时间范围</label>
+        <select id="hours" name="hours" onchange="this.form.submit()">
+          <option value="1" {% if hours == 1 %}selected{% endif %}>最近 1 小时</option>
+          <option value="6" {% if hours == 6 %}selected{% endif %}>最近 6 小时</option>
+          <option value="24" {% if hours == 24 %}selected{% endif %}>最近 24 小时</option>
+          <option value="168" {% if hours == 168 %}selected{% endif %}>最近 7 天</option>
+          <option value="720" {% if hours == 720 %}selected{% endif %}>最近 30 天</option>
+        </select>
+      </div>
+      <noscript><button class="btn" type="submit">应用</button></noscript>
+    </form>
+    {% if run and not run.ok %}
+      <div class="alert alert-error">
+        最近一次采集失败（{{ run.collected_at|date:"m-d H:i:s" }}）：
+        <code>{{ run.error_code }}</code>
+        {% if run.message %} — {{ run.message }}{% endif %}
+        <div class="muted small">曲线中断即由此引起。</div>
+      </div>
+    {% elif not run %}
+      <div class="alert alert-info">尚无采集记录，趋势图为空。</div>
+    {% endif %}
+  </div>
+
+  {# 每个指标一张图：单位不同（%、次/秒、字节）不能叠加在同一 Y 轴上，
+     否则小量级指标会被压成一条平线，看起来像"没有数据"。 #}
+  {% for spec in specs %}
+    <div class="card">
+      <h2>{{ spec.label }}{% if spec.unit %} <span class="muted small">（{{ spec.unit }}）</span>{% endif %}</h2>
+      <div class="trend-chart" data-metric="{{ spec.key }}"></div>
+    </div>
+  {% endfor %}
+
+  {{ specs|json_script:"trend-meta" }}
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if specs %}
+<script src="{% static 'js/charts.js' %}"></script>
+<script>
+(function () {
+  var meta = JSON.parse(document.getElementById('trend-meta').textContent);
+  var instanceId = '{{ instance.id }}';
+  var hours = '{{ hours }}';
+  var boxes = document.querySelectorAll('.trend-chart[data-metric]');
+  for (var i = 0; i < boxes.length; i++) {
+    var metric = boxes[i].getAttribute('data-metric');
+    var chart = new TrendChart(boxes[i], { height: 220 });
+    chart.load('/api/v1/monitor/series?metrics=' + encodeURIComponent(metric) +
+      '&instance_ids=' + encodeURIComponent(instanceId) +
+      '&hours=' + encodeURIComponent(hours));
+  }
+})();
+</script>
+{% endif %}
+{% endblock %}

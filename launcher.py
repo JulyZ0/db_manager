@@ -426,6 +426,7 @@ def run_migrate() -> int:
     result = subprocess.run(
         [sys.executable, "manage.py", "migrate", "--noinput"],
         cwd=str(ROOT),
+        env=utf8_child_env(),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -460,6 +461,7 @@ def run_collectstatic() -> int:
             "0",
         ],
         cwd=str(ROOT),
+        env=utf8_child_env(),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -481,6 +483,7 @@ def ensure_admin_account() -> int:
     result = subprocess.run(
         [sys.executable, "manage.py", "ensure_admin"],
         cwd=str(ROOT),
+        env=utf8_child_env(),
         capture_output=True,
         text=True,
         encoding="utf-8",

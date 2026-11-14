@@ -7,7 +7,12 @@ from __future__ import annotations
 
 from django.urls import path
 
-from apps.web import views
+from apps.web import (
+    monitor_alert_views,
+    monitor_instance_views,
+    monitor_views,
+    views,
+)
 
 app_name = "web"
 
@@ -50,6 +55,17 @@ urlpatterns = [
         views.cluster_replication_auto,
         name="cluster_replication_auto",
     ),
+    # 集群监控（观测视图与资产编辑分开：页面改坏不影响 CRUD 流程）
+    path(
+        "clusters/<int:cluster_id>/monitor/",
+        monitor_views.cluster_overview,
+        name="cluster_overview",
+    ),
+    path(
+        "clusters/<int:cluster_id>/monitor/space/",
+        monitor_views.cluster_space,
+        name="cluster_space",
+    ),
     path("clusters/<int:cluster_id>/edit/", views.cluster_edit, name="cluster_edit"),
     path(
         "clusters/<int:cluster_id>/delete/", views.cluster_delete, name="cluster_delete"
@@ -71,6 +87,37 @@ urlpatterns = [
     path(
         "instances/<int:instance_id>/probe/", views.instance_probe, name="instance_probe"
     ),
+    # 实例监控（只读观测视图，与资产编辑分开）
+    path(
+        "instances/<int:instance_id>/monitor/trend/",
+        monitor_instance_views.instance_trend,
+        name="instance_trend",
+    ),
+    path(
+        "instances/<int:instance_id>/monitor/realtime/",
+        monitor_instance_views.instance_realtime,
+        name="instance_realtime",
+    ),
+    path(
+        "instances/<int:instance_id>/monitor/space/",
+        monitor_instance_views.instance_space,
+        name="instance_space",
+    ),
+    path(
+        "instances/<int:instance_id>/monitor/sessions/",
+        monitor_instance_views.instance_sessions,
+        name="instance_sessions",
+    ),
+    path(
+        "instances/<int:instance_id>/monitor/slowlog/",
+        monitor_instance_views.instance_slowlog,
+        name="instance_slowlog",
+    ),
+    path(
+        "instances/<int:instance_id>/monitor/profile/",
+        monitor_views.instance_profile,
+        name="instance_profile",
+    ),
     # 详情页打开后异步调用：只读验证凭据，不落库
     path(
         "instances/<int:instance_id>/verify-credentials/",
@@ -89,6 +136,52 @@ urlpatterns = [
     path("rotation/", views.rotation_policy, name="rotation_policy"),
     path("rotation/run/", views.rotation_run_now, name="rotation_run_now"),
     # 慢请求
+    # 监控大盘（全局观测入口）
+    path("monitor/", monitor_views.monitor_dashboard, name="monitor_dashboard"),
+    # 告警：事件中心 + 规则管理
+    # SQL 洞察：全库 TOP 与单实例两个视角
+    # 巡检评分与诊断报告
+    path("monitor/inspect/", monitor_views.inspect_overview, name="inspect_overview"),
+    path(
+        "instances/<int:instance_id>/monitor/report/",
+        monitor_views.inspect_report,
+        name="inspect_report",
+    ),
+    path(
+        "clusters/<int:cluster_id>/monitor/report/",
+        monitor_views.cluster_report,
+        name="cluster_report",
+    ),
+    # 锁分析：全库与单实例两个视角
+    path("monitor/locks/", monitor_views.lock_analysis, name="lock_analysis"),
+    path(
+        "instances/<int:instance_id>/monitor/locks/",
+        monitor_views.lock_analysis,
+        name="instance_lock_analysis",
+    ),
+    path("monitor/sql/", monitor_views.sql_insight, name="sql_insight"),
+    path(
+        "instances/<int:instance_id>/monitor/sql/",
+        monitor_views.sql_insight,
+        name="instance_sql_insight",
+    ),
+    path("monitor/alerts/", monitor_alert_views.alert_events, name="alert_events"),
+    path("monitor/alerts/rules/", monitor_alert_views.alert_rules, name="alert_rules"),
+    path(
+        "monitor/alerts/rules/new/",
+        monitor_alert_views.alert_rule_create,
+        name="alert_rule_create",
+    ),
+    path(
+        "monitor/alerts/rules/<int:rule_id>/edit/",
+        monitor_alert_views.alert_rule_edit,
+        name="alert_rule_edit",
+    ),
+    path(
+        "monitor/alerts/rules/<int:rule_id>/delete/",
+        monitor_alert_views.alert_rule_delete,
+        name="alert_rule_delete",
+    ),
     path("slow-requests/", views.slow_requests, name="slow_requests"),
     # 终端风格控制台
     path("console/", views.console, name="console"),

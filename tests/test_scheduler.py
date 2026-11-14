@@ -127,11 +127,75 @@ def test_auto_mode_falls_back_when_broker_down(monkeypatch, settings):
     assert scheduler_mod.resolve_mode() == "inprocess"
 
 
-def test_auto_mode_uses_celery_when_broker_up(monkeypatch, settings):
+def test_auto_mode_uses_celery_only_when_worker_responsive(monkeypatch, settings):
+    """broker 通且 worker 有回应，才判定为 Celery。"""
     settings.SCHEDULER_MODE = "auto"
     settings.CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"
 
     from common import scheduler as scheduler_mod
 
     monkeypatch.setattr(scheduler_mod, "probe_broker", lambda *a, **k: True)
+    monkeypatch.setattr(scheduler_mod, "probe_worker", lambda *a, **k: True)
     assert scheduler_mod.resolve_mode() == "celery"
+
+
+def test_auto_mode_degrades_when_broker_up_but_no_worker(monkeypatch, settings):
+    """**关键回归：Redis 起着但 worker 没起，必须降级。**
+
+    这是最常见的部署状态（Redis 开机自启、worker 需手动拉）。若此时判定为
+    Celery，所有定时任务都会静默不执行——密码不轮换、指标不采集、
+    告警不评估——而页面显示"已连接消息队列，按计划执行"。
+    """
+    settings.SCHEDULER_MODE = "auto"
+    settings.CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"
+
+    from common import scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "probe_broker", lambda *a, **k: True)
+    monkeypatch.setattr(scheduler_mod, "probe_worker", lambda *a, **k: False)
+    assert scheduler_mod.resolve_mode() == "inprocess"
+
+
+def test_broker_down_does_not_probe_worker(monkeypatch, settings):
+    """broker 都不通就不必再探 worker，省掉一次 0.5 秒超时。"""
+    settings.SCHEDULER_MODE = "auto"
+    settings.CELERY_BROKER_URL = "redis://127.0.0.1:6399/0"
+
+    from common import scheduler as scheduler_mod
+
+    called = []
+    monkeypatch.setattr(scheduler_mod, "probe_broker", lambda *a, **k: False)
+    monkeypatch.setattr(
+        scheduler_mod, "probe_worker", lambda *a, **k: called.append(1) or True
+    )
+
+    assert scheduler_mod.resolve_mode() == "inprocess"
+    assert called == []
+
+
+def test_explicit_celery_not_overridden_by_missing_worker(monkeypatch, settings):
+    """显式 SCHEDULER_MODE=celery 时尊重配置，不静默改跑进程内调度。
+
+    否则运维以为任务在 Celery 里跑、实际却在 Web 进程内跑，
+    多进程部署下还会重复执行。
+    """
+    settings.SCHEDULER_MODE = "celery"
+
+    from common import scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "probe_worker", lambda *a, **k: False)
+    assert scheduler_mod.resolve_mode() == "celery"
+
+
+def test_probe_worker_returns_false_on_error(monkeypatch):
+    """探测自身出错（无 broker/无驱动）时必须返回 False 而不是抛出。"""
+    from common import scheduler as scheduler_mod
+
+    class Boom:
+        class control:
+            @staticmethod
+            def inspect(*args, **kwargs):
+                raise RuntimeError("no broker")
+
+    monkeypatch.setattr("config.celery.app", Boom(), raising=False)
+    assert scheduler_mod.probe_worker(timeout=0.01) is False

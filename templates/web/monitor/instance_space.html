@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ instance.name }} · 空间分析{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ instance.name }} · 空间分析</h1>
+    <div class="sub">
+      {{ instance.cluster.name }} · {{ instance.cluster.get_engine_display }}
+      · 取最近一次采样的分库占用
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{% url 'web:cluster_space' instance.cluster.id %}">集群空间</a>
+    <a class="btn" href="{% url 'web:instance_detail' instance.id %}">实例详情</a>
+  </div>
+</div>
+
+{% if not space_supported %}
+  <div class="card">
+    <div class="alert alert-warning">
+      「{{ instance.cluster.get_engine_display }}」引擎暂不支持空间采集。
+    </div>
+  </div>
+{% else %}
+  <div class="card">
+    <h2>合计</h2>
+    <div class="cards">
+      <div class="stat-card">
+        <div class="label">库 / 维度数</div>
+        <div class="value">{{ databases|length }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">合计占用</div>
+        <div class="value" data-bytes="{{ total|floatformat:"0" }}">{{ total|floatformat:"0" }} B</div>
+      </div>
+    </div>
+    {% if not databases %}
+      <p class="muted small">
+        还没有空间数据。空间指标随采集周期落库，稍等一轮即可。
+      </p>
+    {% endif %}
+  </div>
+
+  {% if databases %}
+    <div class="card">
+      <h2>分库占用</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>库 / 维度</th><th>占用</th><th>占比</th></tr></thead>
+          <tbody>
+            {% for row in databases %}
+              <tr>
+                <td class="mono">{{ row.database }}</td>
+                <td data-bytes="{{ row.size|floatformat:"0" }}">{{ row.size|floatformat:"0" }} B</td>
+                <td>
+                  {% if total > 0 %}
+                    <div class="bar"><span style="width: {% widthratio row.size total 100 %}%"></span></div>
+                    <span class="muted small">{% widthratio row.size total 100 %}%</span>
+                  {% else %}
+                    <span class="muted">—</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% endif %}
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{% static 'js/bytes.js' %}" defer></script>
+{% endblock %}

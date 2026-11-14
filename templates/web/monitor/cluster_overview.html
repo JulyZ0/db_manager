@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ cluster.name }} · 集群概览{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ cluster.name }} · 集群概览</h1>
+    <div class="sub">
+      {{ cluster.department.name }}
+      · {{ cluster.get_engine_display }}
+      · {{ cluster.get_env_display }}
+      · 采集周期 {{ interval_minutes }} 分钟
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{% url 'web:cluster_space' cluster.id %}">空间分析</a>
+    <a class="btn" href="{% url 'web:cluster_detail' cluster.id %}">拓扑</a>
+    <a class="btn" href="{% url 'web:cluster_list' %}">返回列表</a>
+  </div>
+</div>
+
+{% if not has_metrics %}
+  <div class="card">
+    <div class="alert alert-warning">
+      当前集群引擎为「{{ cluster.get_engine_display }}」，暂不支持指标采集。
+      仅 MySQL / PostgreSQL / Redis 三种引擎有采集器，其余引擎可正常管理资产，
+      但不会有监控数据。
+    </div>
+  </div>
+{% else %}
+
+{# 采集健康度：先回答"数据可信吗"，再看具体数值 #}
+<div class="card">
+  <h2>采集健康度</h2>
+  <div class="cards">
+    <div class="stat-card">
+      <div class="label">实例总数</div>
+      <div class="value">{{ summary.total }}</div>
+      <div class="hint">集群内全部实例</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">已有采集记录</div>
+      <div class="value">{{ summary.collected }}</div>
+      <div class="hint">仅启用实例会被采集</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">最近一次成功</div>
+      <div class="value">{{ summary.healthy }}</div>
+      <div class="hint">数据新鲜可用</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">最近一次失败</div>
+      <div class="value">
+        {% if summary.failing %}
+          <span style="color:#b91c1c">{{ summary.failing }}</span>
+        {% else %}0{% endif %}
+      </div>
+      <div class="hint">见下方具体错误码</div>
+    </div>
+  </div>
+  {% if summary.collected == 0 %}
+    <p class="muted small">
+      尚无采集记录。采集按分钟级周期运行，稍等一轮即可看到数据；
+      若长时间无数据，请检查实例是否已登记密码、以及
+      <code>MONITOR_COLLECT_ENABLED</code> 是否为 True。
+    </p>
+  {% endif %}
+</div>
+
+{% for row in rows %}
+  <div class="card">
+    <h2>
+      <a href="{% url 'web:instance_detail' row.instance.id %}">{{ row.instance.name }}</a>
+      {% if row.instance.role == "master" %}
+        <span class="badge badge-blue">主库</span>
+      {% elif row.instance.role == "slave" %}
+        <span class="badge badge-green">从库</span>
+      {% else %}
+        <span class="badge badge-gray">代理</span>
+      {% endif %}
+      {% if not row.instance.is_active %}
+        <span class="badge badge-gray">停用</span>
+      {% endif %}
+      <span class="muted small mono">{{ row.instance.host }}:{{ row.instance.port }}</span>
+    </h2>
+
+    {# 采集状态先于指标展示：数据不新鲜时，下面的数字不该被当真 #}
+    {% if not row.run %}
+      <div class="alert alert-info">尚无采集记录（新实例或采集未开启）。</div>
+    {% elif not row.run.ok %}
+      <div class="alert alert-error">
+        最近一次采集失败（{{ row.run.collected_at|date:"m-d H:i:s" }}）：
+        <code>{{ row.run.error_code }}</code>
+        {% if row.run.message %} — {{ row.run.message }}{% endif %}
+      </div>
+    {% else %}
+      <div class="muted small">
+        最近采集 {{ row.run.collected_at|date:"m-d H:i:s" }} ·
+        {{ row.run.metrics_count }} 项指标 ·
+        耗时 {{ row.run.duration_ms }}ms
+      </div>
+    {% endif %}
+
+    <div class="metric-grid">
+      {% for cell in row.metrics %}
+        <div class="metric-cell">
+          <div class="metric-label">{{ cell.label }}</div>
+          <div class="metric-value">
+            {% if cell.value is None %}
+              <span class="muted">—</span>
+            {% elif cell.unit == "bytes" %}
+              <span data-bytes="{{ cell.value }}">{{ cell.value|floatformat:"0" }} B</span>
+            {% else %}
+              {{ cell.value|floatformat:"-2" }}
+              {% if cell.unit %}<small>{{ cell.unit }}</small>{% endif %}
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+{% empty %}
+  <div class="card">
+    <p class="muted">该集群下还没有实例。先加实例并登记密码，采集才会开始。</p>
+  </div>
+{% endfor %}
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{% static 'js/bytes.js' %}" defer></script>
+{% endblock %}

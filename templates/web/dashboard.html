@@ -49,7 +49,9 @@
       {% if scheduler_mode == "celery" %}
         <span class="badge badge-green">Celery</span> 已连接消息队列，按计划执行轮换与统计
       {% elif scheduler_mode == "inprocess" %}
-        <span class="badge badge-amber">进程内调度</span> 未检测到 Redis，已自动降级为本进程内定时执行
+        <span class="badge badge-amber">进程内调度</span>
+        没有检测到可用的 Celery worker（消息队列不可达或 worker 未启动），
+        已自动降级为在本进程内定时执行
       {% else %}
         <span class="badge badge-gray">{{ scheduler_mode }}</span>
       {% endif %}

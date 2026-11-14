@@ -138,6 +138,8 @@ INSTALLED_APPS = [
     "apps.metrics",
     # 目标库连接控制台（连目标库验证凭据、执行语句）
     "apps.dbconsole",
+    # 目标库指标采集与观测（趋势/空间/会话/锁/告警）
+    "apps.monitor",
     # 可视化界面（服务端渲染，面向运维人员）
     "apps.web",
 ]
@@ -511,6 +513,40 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.metrics.tasks.cleanup_expired_logs",
         "schedule": crontab(minute=30, hour=3),
     },
+    # 监控采集：按 MONITOR_INTERVAL_MINUTES 触发。
+    #
+    # 为什么直接用 crontab(minute=f"*/{N}") 而不写死：周期由环境变量决定，
+    # 在 import settings 时就已确定，与 beat 启动时读到的值天然一致。
+    # 下限夹到 1 分钟——进程内调度器按分钟去重（minute_key 形如 %Y%m%d%H%M），
+    # 写 0 或负数会导致 crontab 表达式非法、任务永不触发。
+    "collect-metrics": {
+        "task": "apps.monitor.tasks.collect_metrics",
+        "schedule": crontab(
+            minute=f"*/{max(1, min(60, env_int('MONITOR_INTERVAL_MINUTES', 1)))}"
+        ),
+    },
+    # 04:10 清理监控时序数据：与 03:30 的日志清理错开，
+    # 避免两批大批量 DELETE 撞在一起长时间占写锁。
+    "purge-metric-samples": {
+        "task": "apps.monitor.tasks.purge_metric_samples",
+        "schedule": crontab(minute=10, hour=4),
+    },
+    # 锁采集：默认每 5 分钟。锁查询要 join 多张性能视图，成本高于指标；
+    # 且 LockWait 是瞬时状态（每轮清空重写），按分钟累积没有意义。
+    "collect-locks": {
+        "task": "apps.monitor.tasks.collect_locks",
+        "schedule": crontab(
+            minute=f"*/{max(1, min(60, env_int('MONITOR_LOCK_INTERVAL_MINUTES', 5)))}"
+        ),
+    },
+    # 告警评估：与采集错开半分钟没有意义（crontab 精度是分钟），
+    # 因此同频运行。评估只读本地指标表，不连目标库，开销很小。
+    "evaluate-alerts": {
+        "task": "apps.monitor.tasks.evaluate_alerts",
+        "schedule": crontab(
+            minute=f"*/{max(1, min(60, env_int('MONITOR_ALERT_INTERVAL_MINUTES', 1)))}"
+        ),
+    },
 }
 
 
@@ -524,6 +560,11 @@ CELERY_BEAT_SCHEDULE = {
 # 与 Celery 模式共用任务实现，切换无需改代码。
 SCHEDULER_MODE = env("SCHEDULER_MODE", "auto")
 SCHEDULER_REDIS_PROBE_TIMEOUT = 0.3  # 秒，auto 模式探测 broker 的超时
+# auto 模式下探测「是否有 celery worker 在消费」的超时（秒）。
+# 只有 broker 通、且 worker 有回应，才判定为 Celery 模式：
+# Redis 起着但 worker 没起是最常见的部署状态，此时若判定为 Celery，
+# 所有定时任务都会静默不执行而页面显示一切正常。
+SCHEDULER_WORKER_PROBE_TIMEOUT = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +635,63 @@ DB_CONNECT_TIMEOUT_SECONDS = max(1, min(30, env_int("DB_CONNECT_TIMEOUT_SECONDS"
 DB_QUERY_TIMEOUT_SECONDS = max(1, min(300, env_int("DB_QUERY_TIMEOUT_SECONDS", 30)))
 # 控制台单次查询最多回显多少行。防止 SELECT * 把内存和页面撑爆。
 DB_MAX_ROWS = max(1, min(5000, env_int("DB_MAX_ROWS", 500)))
+
+# --- 监控采集 ---------------------------------------------------------------
+# 是否启用目标库指标采集。默认 True；关掉后所有 monitor 页面仍可打开，
+# 但只展示历史数据并提示"采集已关闭"，不会静默消失。
+MONITOR_COLLECT_ENABLED = env_bool("MONITOR_COLLECT_ENABLED", True)
+# 采集周期（分钟）。下限 1 分钟是硬约束：进程内调度器按分钟去重
+# （minute_key = %Y%m%d%H%M），低于 1 分钟无法表达，写 0 会导致永远不触发。
+MONITOR_INTERVAL_MINUTES = max(1, min(60, env_int("MONITOR_INTERVAL_MINUTES", 1)))
+# 单个实例单次采集的超时（秒）。这是**每个查询**的上限，不是整轮采集的上限。
+MONITOR_TIMEOUT_SECONDS = max(1, min(60, env_int("MONITOR_TIMEOUT_SECONDS", 5)))
+# 每轮采集最多并发几个实例。并发过高会把自己的连接数打满，
+# 也会在 SQLite 上造成写锁争抢。
+MONITOR_CONCURRENCY = max(1, min(32, env_int("MONITOR_CONCURRENCY", 4)))
+# 指标与采集记录的保留天数。0 表示永久保留（不建议：时序表增长很快）。
+MONITOR_RETENTION_DAYS = max(0, min(3650, env_int("MONITOR_RETENTION_DAYS", 30)))
+# 单轮采集最多处理多少个实例（0 = 不限）。超大部署可分批轮转，
+# 避免一轮太久把自己的采集周期拖长。
+MONITOR_MAX_INSTANCES = max(0, min(10000, env_int("MONITOR_MAX_INSTANCES", 0)))
+
+# --- 告警 -------------------------------------------------------------------
+# 是否启用告警评估。关掉后规则与历史事件都保留，只是不再产生新事件。
+MONITOR_ALERT_ENABLED = env_bool("MONITOR_ALERT_ENABLED", True)
+# 告警评估周期（分钟）。与采集同频即可：更频繁没有新数据可评。
+MONITOR_ALERT_INTERVAL_MINUTES = max(
+    1, min(60, env_int("MONITOR_ALERT_INTERVAL_MINUTES", 1))
+)
+# 告警事件"多久没再命中"就自动恢复（分钟）。
+# 采集停掉时 firing 事件不会自己恢复，需要这个兜底，否则故障早好了告警还在响。
+MONITOR_ALERT_STALE_MINUTES = max(
+    1, min(1440, env_int("MONITOR_ALERT_STALE_MINUTES", 15))
+)
+# 通知 webhook 地址（留空 = 不通知）。企业微信/钉钉机器人等直接填 URL。
+# 只发"新触发"与"恢复"两类事件，不重复推送，避免刷屏。
+MONITOR_ALERT_WEBHOOK_URL = (env("MONITOR_ALERT_WEBHOOK_URL", "") or "").strip()
+# webhook 请求超时（秒）。告警通知不该拖慢评估任务。
+MONITOR_ALERT_WEBHOOK_TIMEOUT = max(
+    1, min(30, env_int("MONITOR_ALERT_WEBHOOK_TIMEOUT", 5))
+)
+
+# --- SQL 洞察 ---------------------------------------------------------------
+# 是否随采集顺带抓取语句统计（MySQL performance_schema / PG pg_stat_statements
+# / Redis commandstats）。关掉后洞察页仍可打开，只是不再新增指纹。
+MONITOR_SQL_INSIGHT_ENABLED = env_bool("MONITOR_SQL_INSIGHT_ENABLED", True)
+# SQL 指纹保留天数。0 = 永久保留。指纹比指标增长慢（按模板聚合而非按采样点），
+# 因此默认给更长的窗口。
+MONITOR_SQL_RETENTION_DAYS = max(
+    0, min(3650, env_int("MONITOR_SQL_RETENTION_DAYS", 90))
+)
+
+# --- 锁分析 ---------------------------------------------------------------
+# 是否采集锁等待与死锁。默认 True；关掉后锁分析页仍可打开，只是不再更新。
+MONITOR_LOCK_ENABLED = env_bool("MONITOR_LOCK_ENABLED", True)
+# 锁采集周期（分钟）。默认 5：锁查询要 join 多张视图，比指标查询贵得多，
+# 没必要与指标同频；而且锁等待是瞬时状态，采太密只是重复看到同一批。
+MONITOR_LOCK_INTERVAL_MINUTES = max(
+    1, min(60, env_int("MONITOR_LOCK_INTERVAL_MINUTES", 5))
+)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}{{ instance.name }} · 诊断报告{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ instance.name }} · 诊断报告</h1>
+    <div class="sub">
+      {{ instance.cluster.department.name }} / {{ instance.cluster.name }}
+      · {{ instance.cluster.get_engine_display }}
+      · 生成于 {{ generated_at|date:"Y-m-d H:i:s" }}
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" type="button" onclick="location.reload()">重新生成</button>
+    <a class="btn" href="{% url 'web:inspect_overview' %}">巡检总览</a>
+    <a class="btn" href="{% url 'web:instance_trend' instance.id %}">性能趋势</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>总评</h2>
+  <div class="cards">
+    <div class="stat-card">
+      <div class="label">健康分</div>
+      <div class="value">{{ report.score }}</div>
+      <div class="hint">{{ report.grade }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">通过</div>
+      <div class="value" style="color:#15803d">{{ report.counts.ok }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">警告</div>
+      <div class="value" style="color:#b45309">{{ report.counts.warn }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">失败</div>
+      <div class="value" style="color:#b91c1c">{{ report.counts.fail }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">无数据</div>
+      <div class="value muted">{{ report.counts.unknown }}</div>
+    </div>
+  </div>
+
+  {% if report.insufficient %}
+    <div class="alert alert-warning">
+      指标类检查全部没有数据，当前分数**不代表健康度**，只说明还无从判断。
+      请先确认实例已登记密码、采集任务正常运行，并检查下方「数据不足」项列出的原因。
+    </div>
+  {% endif %}
+</div>
+
+{# 扣分项置顶：打开报告是为了找问题，不是为了看满分项 #}
+<div class="card">
+  <h2>需要处理（{{ problems|length }} 项）</h2>
+  {% if not problems %}
+    <p class="muted">没有警告或失败项。</p>
+  {% else %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>检查项</th><th>类别</th><th>状态</th><th>得分</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          {% for item in problems %}
+            <tr>
+              <td><strong>{{ item.label }}</strong></td>
+              <td class="muted small">{{ item.category }}</td>
+              <td>
+                {% if item.status == "fail" %}
+                  <span class="badge badge-red">失败</span>
+                {% else %}
+                  <span class="badge badge-amber">警告</span>
+                {% endif %}
+              </td>
+              <td>{{ item.score }}</td>
+              <td class="small">{{ item.detail }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>通过项（{{ passed|length }} 项）</h2>
+  {% if not passed %}
+    <p class="muted">没有通过的检查项。</p>
+  {% else %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>检查项</th><th>类别</th><th>得分</th><th>说明</th></tr></thead>
+        <tbody>
+          {% for item in passed %}
+            <tr>
+              <td>{{ item.label }}</td>
+              <td class="muted small">{{ item.category }}</td>
+              <td style="color:#15803d">{{ item.score }}</td>
+              <td class="small muted">{{ item.detail }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
+{% if unknown %}
+  <div class="card">
+    <h2>数据不足（{{ unknown|length }} 项）</h2>
+    <p class="muted small">这些项没有可用数据，<strong>未参与评分</strong>。列出原因便于排查采集范围。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>检查项</th><th>原因</th></tr></thead>
+        <tbody>
+          {% for item in unknown %}
+            <tr>
+              <td>{{ item.label }}</td>
+              <td class="small muted">{{ item.detail }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endif %}
+
+<div class="card">
+  <h2>报告依据</h2>
+  <p class="muted small">
+    本报告只读取本地已采集的数据，不会连接目标库，因此可以随时刷新。
+    评分涉及的指标：
+  </p>
+  {% if metrics %}
+    <ul class="plain-list mono small">
+      {% for metric in metrics %}<li>{{ metric }}</li>{% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted small">当前引擎没有对应的评分指标，仅基础项参与评分。</p>
+  {% endif %}
+</div>
+{% endblock %}

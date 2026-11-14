@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 # 进程内调度器的轮询间隔。任务精度要求是「分钟级」，15 秒足够且开销可忽略。
 TICK_SECONDS = 15
 
+# 启动时确定下来的模式。cache 住是为了让页面渲染不必每次都探测 worker。
+_resolved_mode: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # 模式判定
@@ -51,6 +54,28 @@ def probe_broker(url: str, timeout: float = 0.3) -> bool:
         return False
 
 
+def probe_worker(timeout: float = 0.5) -> bool:
+    """探测是否有 celery worker 正在消费任务（对其发 ping）。
+
+    为什么不能只看 broker 端口
+    --------------------------
+    Redis 起着、worker 没起，是**最常见**的部署状态：装了 Redis 的服务
+    开机自启，而 worker 需要手动拉。此时只探测端口会判定成 Celery 模式，
+    页面显示"已连接消息队列，按计划执行轮换与统计"，而实际**一条定时任务
+    都不会执行**——密码不再轮换、指标不再采集、告警不再评估，
+    但界面上一切正常。这是最糟的一类故障：沉默且看起来健康。
+
+    活跃 worker 必然响应 ping，因此 ping 有回应才是"真能跑任务"的证据。
+    """
+    try:
+        from config.celery import app as celery_app
+
+        replies = celery_app.control.inspect(timeout=timeout, limit=1).ping()
+        return bool(replies)
+    except Exception:  # noqa: BLE001 - 探测失败一律当作"没有可用 worker"
+        return False
+
+
 def resolve_mode() -> str:
     """返回实际生效的调度模式："celery" 或 "inprocess"。"""
     mode = (getattr(settings, "SCHEDULER_MODE", "auto") or "auto").lower()
@@ -58,14 +83,27 @@ def resolve_mode() -> str:
     if mode == "inprocess":
         return "inprocess"
 
+    # 显式 celery：尊重运维的判断，不替他把模式改掉。
+    # 缺 worker 的问题由页面与日志提示，而不是静默换一种执行方式——
+    # 显式配置了 celery 却跑进程内调度，会造成"以为在 Celery 跑"的误解。
     if mode == "celery":
         return "celery"
 
-    # auto：探测 broker
+    # auto：先看 broker 通不通，再看有没有 worker 在消费
     broker = getattr(settings, "CELERY_BROKER_URL", "")
     timeout = getattr(settings, "SCHEDULER_REDIS_PROBE_TIMEOUT", 0.3)
     if broker and probe_broker(broker, timeout):
-        return "celery"
+        worker_timeout = getattr(settings, "SCHEDULER_WORKER_PROBE_TIMEOUT", 0.5)
+        if probe_worker(worker_timeout):
+            return "celery"
+        logger.warning(
+            "消息队列（%s）可达，但没有检测到 celery worker 在消费任务，"
+            "自动降级为进程内调度。定时任务仍会执行，只是不经过 Celery。"
+            "如需使用 Celery，请启动 worker 与 beat："
+            "celery -A config worker -l info  /  celery -A config beat -l info",
+            broker,
+        )
+        return "inprocess"
 
     logger.warning(
         "未探测到消息队列（%s），自动降级为进程内调度。"
@@ -247,9 +285,10 @@ def start_scheduler_if_needed() -> str:
     在 AppConfig.ready() 中调用。注意只在主进程启动：
     runserver 的 autoreload 会派生一个子进程，父进程不应起调度线程。
     """
-    global _scheduler
+    global _scheduler, _resolved_mode
 
     mode = resolve_mode()
+    _resolved_mode = mode
     if mode != "inprocess":
         logger.info("调度模式：Celery（任务由 celery worker + beat 执行）")
         return mode
@@ -262,7 +301,14 @@ def start_scheduler_if_needed() -> str:
 
 
 def current_mode() -> str:
-    """供页面展示当前调度模式。"""
+    """供页面展示当前调度模式。
+
+    优先用启动时确定的结果：``resolve_mode`` 在 auto 模式下会探测 worker，
+    每次请求都探一次会给每个页面白加半秒延迟。进程内调度器已运行时直接
+    返回 inprocess，也避免重复探测。
+    """
     if _scheduler is not None and _scheduler.is_running():
         return "inprocess"
+    if _resolved_mode is not None:
+        return _resolved_mode
     return resolve_mode()

@@ -151,10 +151,14 @@ class QueryResult:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_password(instance: Instance) -> tuple[str | None, str | None]:
+def resolve_password(instance: Instance) -> tuple[str | None, str | None]:
     """取出明文密码，返回 (password, error_code)。
 
     解密失败不能向上抛：调用方要的是"这次验证失败及原因"，不是 500。
+
+    公开而非私有：监控采集层（apps.monitor）需要同一套语义——「未登记密码」
+    与「解密失败」是两种不同的运维动作，若各处自己调 decrypt_secret，
+    迟早会有一处把异常漏给调用方。
     """
     if not instance.password_ciphertext:
         return None, ERROR_NO_PASSWORD
@@ -489,7 +493,7 @@ def verify_credentials(instance: Instance, timeout: float | None = None) -> Conn
             message=f"引擎「{engine}」暂不支持凭据验证",
         )
 
-    password, error = _resolve_password(instance)
+    password, error = resolve_password(instance)
     if error is not None:
         return ConnectionInfo(ok=False, engine=engine, error=error)
 
@@ -1560,7 +1564,7 @@ def execute_statement(
         )
         return result
 
-    password, error = _resolve_password(instance)
+    password, error = resolve_password(instance)
     if error is not None:
         result = QueryResult(ok=False, error=error)
         record_audit(

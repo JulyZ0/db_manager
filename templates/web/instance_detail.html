@@ -28,6 +28,7 @@
       <button class="btn" type="submit" {% if not instance.is_active %}disabled{% endif %}>轮换密码</button>
     </form>
     <a class="btn" href="{% url 'web:instance_edit' instance.id %}">编辑</a>
+    <a class="btn" href="{% url 'web:instance_trend' instance.id %}">监控</a>
     <a class="btn" href="{% url 'web:instance_list' %}">返回列表</a>
   </div>
 </div>

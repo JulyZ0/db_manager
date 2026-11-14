@@ -25,6 +25,12 @@
          class="{% if active_nav == 'clusters' %}active{% endif %}">集群管理</a>
       <a href="{% url 'web:instance_list' %}"
          class="{% if active_nav == 'instances' %}active{% endif %}">实例管理</a>
+      <a href="{% url 'web:monitor_dashboard' %}"
+         class="{% if active_nav == 'monitor' %}active{% endif %}">监控大盘</a>
+      <a href="{% url 'web:alert_events' %}"
+         class="{% if active_nav == 'alerts' %}active{% endif %}">告警</a>
+      <a href="{% url 'web:inspect_overview' %}"
+         class="{% if active_nav == 'inspect' %}active{% endif %}">巡检评分</a>
       <a href="{% url 'web:rotation_policy' %}"
          class="{% if active_nav == 'rotation' %}active{% endif %}">定时轮换</a>
       <a href="{% url 'web:stats' %}"

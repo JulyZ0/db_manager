@@ -78,6 +78,7 @@
             </td>
             <td>
               <div class="actions">
+                <a class="btn btn-sm" href="{% url 'web:cluster_overview' cluster.id %}">监控</a>
                 <a class="btn btn-sm" href="{% url 'web:cluster_edit' cluster.id %}">编辑</a>
                 <a class="btn btn-sm" href="{% url 'web:instance_create' %}?cluster_id={{ cluster.id }}">加实例</a>
                 <form class="inline-form" method="post"

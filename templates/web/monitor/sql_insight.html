@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}SQL 洞察{% if instance %} · {{ instance.name }}{% endif %} · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>SQL 洞察{% if instance %} · {{ instance.name }}{% endif %}</h1>
+    <div class="sub">
+      {% if instance %}
+        {{ instance.cluster.name }} · {{ instance.cluster.get_engine_display }}
+      {% else %}
+        全库视图，按语句模板聚合（同构语句已合并）
+      {% endif %}
+      · 共 {{ total_count }} 条模板，展示 TOP 100
+    </div>
+  </div>
+  <div class="actions">
+    {% if instance %}
+      <a class="btn" href="{% url 'web:instance_trend' instance.id %}">性能趋势</a>
+      <a class="btn" href="{% url 'web:sql_insight' %}">全库视图</a>
+    {% else %}
+      <a class="btn" href="{% url 'web:monitor_dashboard' %}">监控大盘</a>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <form method="get" class="filters">
+    <div class="field">
+      <label for="sort">排序依据</label>
+      <select id="sort" name="sort" onchange="this.form.submit()">
+        <option value="total" {% if sort == "total" %}selected{% endif %}>总耗时（累计）</option>
+        <option value="avg" {% if sort == "avg" %}selected{% endif %}>单次平均耗时</option>
+        <option value="count" {% if sort == "count" %}selected{% endif %}>执行次数</option>
+      </select>
+    </div>
+    <noscript><button class="btn" type="submit">应用</button></noscript>
+  </form>
+  <p class="muted small">
+    只按总耗时排序会让「每秒跑一万次」的快查询永远排第一。
+    想找真正拖慢单次请求的语句，请切到「单次平均耗时」。
+  </p>
+</div>
+
+<div class="card">
+  {% if not rows %}
+    <p class="muted">
+      还没有 SQL 指纹数据。可能原因：采集未开启、实例刚加入、
+      或目标库未开启语句统计
+      （MySQL 需 <code>performance_schema</code>、
+      PostgreSQL 需 <code>pg_stat_statements</code> 扩展）。
+    </p>
+  {% else %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {% if not instance %}<th>实例</th>{% endif %}
+            <th>语句模板</th>
+            <th>次数</th>
+            <th>总耗时</th>
+            <th>平均</th>
+            <th>最大</th>
+            <th>扫描行</th>
+            <th>最近</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              {% if not instance %}
+                <td>
+                  <a href="{% url 'web:instance_sql_insight' row.instance_id %}">{{ row.instance.name }}</a>
+                  <div class="muted small mono">{{ row.engine }}</div>
+                </td>
+              {% endif %}
+              <td class="mono small" style="max-width:520px;word-break:break-all">{{ row.template }}</td>
+              <td>{{ row.exec_count }}</td>
+              <td>{{ row.total_time_ms|floatformat:"-1" }} ms</td>
+              <td>{{ row.avg_time_ms|floatformat:"-2" }} ms</td>
+              <td>{{ row.max_time_ms|floatformat:"-1" }} ms</td>
+              <td class="muted">{{ row.rows_examined }}</td>
+              <td class="mono small">{{ row.last_seen_at|date:"m-d H:i" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

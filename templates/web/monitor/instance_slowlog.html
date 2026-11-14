@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ instance.name }} · 慢日志{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ instance.name }} · 慢日志</h1>
+    <div class="sub">
+      {{ instance.cluster.name }} · {{ instance.cluster.get_engine_display }}
+      · 按总耗时降序，取前 50 条
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" type="button" onclick="location.reload()">刷新</button>
+    <a class="btn" href="{% url 'web:instance_trend' instance.id %}">性能趋势</a>
+    <a class="btn" href="{% url 'web:instance_sessions' instance.id %}">会话</a>
+  </div>
+</div>
+
+{% if not result.ok %}
+  <div class="card">
+    <div class="alert alert-error">
+      无法获取慢日志：<code>{{ result.error }}</code>
+      {% if result.message %} — {{ result.message }}{% endif %}
+      {% if result.hint %}<div class="muted small">{{ result.hint }}</div>{% endif %}
+    </div>
+    {% if enable_hint %}
+      <div class="alert alert-info">
+        <strong>如何启用：</strong>{{ enable_hint }}
+      </div>
+    {% endif %}
+  </div>
+{% else %}
+  <div class="card">
+    <h2>慢 SQL 汇总（{{ result.rows|length }} 条）</h2>
+    {% if result.truncated %}
+      <div class="alert alert-warning">结果超过单次返回上限，已截断显示。</div>
+    {% endif %}
+    {% if not result.rows %}
+      <p class="muted">
+        没有记录到慢 SQL。可能是确实没有慢查询，也可能是慢日志/统计扩展尚未积累数据。
+      </p>
+      {% if enable_hint %}
+        <div class="alert alert-info"><strong>启用方式：</strong>{{ enable_hint }}</div>
+      {% endif %}
+    {% else %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              {% for col in result.columns %}<th>{{ col }}</th>{% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in result.rows %}
+              <tr>
+                {% for cell in row %}
+                  <td{% if forloop.first %} class="mono"{% endif %}>{{ cell }}</td>
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </div>
+{% endif %}
+{% endblock %}

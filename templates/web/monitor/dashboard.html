@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}监控大盘 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>监控大盘</h1>
+    <div class="sub">
+      采集周期 {{ interval_minutes }} 分钟
+      {% if not collect_enabled %}
+        · <span class="badge badge-red">采集已关闭</span>（MONITOR_COLLECT_ENABLED=False）
+      {% endif %}
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" type="button" onclick="location.reload()">刷新</button>
+    <a class="btn" href="{% url 'web:cluster_list' %}">集群管理</a>
+  </div>
+</div>
+
+{% if not collect_enabled %}
+  <div class="card">
+    <div class="alert alert-warning">
+      采集开关已关闭，页面只展示历史数据，不会产生新的采样。
+      如需恢复，请把 <code>MONITOR_COLLECT_ENABLED</code> 设为 True 并重启。
+    </div>
+  </div>
+{% endif %}
+
+<div class="cards">
+  <div class="stat-card">
+    <div class="label">启用实例</div>
+    <div class="value">{{ totals.instances }}</div>
+    <div class="hint">停用实例不参与采集</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">采集正常</div>
+    <div class="value" style="color:#15803d">{{ totals.ok }}</div>
+    <div class="hint">最近一次采集成功</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">采集失败</div>
+    <div class="value" style="color:#b91c1c">{{ totals.failed }}</div>
+    <div class="hint">需要处理，见下方清单</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">尚无数据</div>
+    <div class="value" style="color:#6b7280">{{ totals.no_data }}</div>
+    <div class="hint">新实例或采集未启动</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>按引擎</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>引擎</th><th>实例数</th><th>正常</th><th>失败</th><th>无数据</th></tr>
+      </thead>
+      <tbody>
+        {% for row in engines %}
+          <tr>
+            <td class="mono">{{ row.engine }}</td>
+            <td>{{ row.total }}</td>
+            <td>{% if row.ok %}<span style="color:#15803d">{{ row.ok }}</span>{% else %}0{% endif %}</td>
+            <td>{% if row.failed %}<span style="color:#b91c1c">{{ row.failed }}</span>{% else %}0{% endif %}</td>
+            <td class="muted">{{ row.no_data }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="5" class="empty">还没有启用的实例</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# 只列有问题的实例：正常的不占屏幕，这是"大盘"该有的取舍 #}
+<div class="card">
+  <h2>需要关注的实例（{{ problems|length }}）</h2>
+  {% if not problems %}
+    <p class="muted">全部实例采集正常。</p>
+  {% else %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>实例</th><th>集群</th><th>状态</th><th>原因</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          {% for row in problems %}
+            <tr>
+              <td><a href="{% url 'web:instance_profile' row.instance.id %}">{{ row.instance.name }}</a></td>
+              <td>{{ row.instance.cluster.name }}</td>
+              <td>
+                {% if row.run %}
+                  <span class="badge badge-red">采集失败</span>
+                {% else %}
+                  <span class="badge badge-gray">尚无数据</span>
+                {% endif %}
+              </td>
+              <td class="small">
+                {% if row.run %}
+                  <code>{{ row.run.error_code }}</code>
+                  {% if row.run.message %}<div class="muted">{{ row.run.message }}</div>{% endif %}
+                {% else %}
+                  <span class="muted">尚未采集过</span>
+                {% endif %}
+              </td>
+              <td>
+                <div class="actions">
+                  <a class="btn btn-sm" href="{% url 'web:instance_realtime' row.instance.id %}">实时性能</a>
+                  <a class="btn btn-sm" href="{% url 'web:instance_edit' row.instance.id %}">编辑</a>
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>最近采集记录</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>时间</th><th>实例</th><th>结果</th><th>指标数</th><th>耗时</th></tr>
+      </thead>
+      <tbody>
+        {% for run in recent_runs %}
+          <tr>
+            <td class="mono">{{ run.collected_at|date:"m-d H:i:s" }}</td>
+            <td>{{ run.instance.name }}</td>
+            <td>
+              {% if run.ok %}
+                <span class="badge badge-green">成功</span>
+              {% else %}
+                <span class="badge badge-red">{{ run.error_code }}</span>
+              {% endif %}
+            </td>
+            <td>{{ run.metrics_count }}</td>
+            <td class="muted small">{{ run.duration_ms }}ms</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="5" class="empty">还没有任何采集记录</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

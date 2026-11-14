@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ cluster.name }} · 集群空间{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ cluster.name }} · 空间分析</h1>
+    <div class="sub">
+      {{ cluster.department.name }} · {{ cluster.get_engine_display }}
+      · 取各实例最近一次采样的分库数据
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{% url 'web:cluster_overview' cluster.id %}">集群概览</a>
+    <a class="btn" href="{% url 'web:cluster_detail' cluster.id %}">拓扑</a>
+    <a class="btn" href="{% url 'web:cluster_list' %}">返回列表</a>
+  </div>
+</div>
+
+{% if not space_supported %}
+  <div class="card">
+    <div class="alert alert-warning">
+      「{{ cluster.get_engine_display }}」引擎暂不支持空间采集。
+      当前仅 MySQL / PostgreSQL / Redis 有采集器。
+    </div>
+  </div>
+{% else %}
+
+<div class="card">
+  <h2>总览</h2>
+  <div class="cards">
+    <div class="stat-card">
+      <div class="label">采集到的库 / 维度</div>
+      <div class="value">{{ totals.databases }}</div>
+      <div class="hint">跨实例去重后的数量</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">合计占用</div>
+      <div class="value" data-bytes="{{ totals.instance_sum|floatformat:"0" }}">
+        {{ totals.instance_sum|floatformat:"0" }} B
+      </div>
+      <div class="hint">各实例最新快照之和</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">实例数</div>
+      <div class="value">{{ instances|length }}</div>
+      <div class="hint">含停用实例</div>
+    </div>
+  </div>
+  {% if not databases %}
+    <p class="muted small">
+      还没有空间数据。空间指标随采集周期落库，稍等一轮；
+      若长期为空，PostgreSQL 需账号具备 <code>pg_database_size</code> 权限，
+      MySQL 需可读 <code>information_schema</code>。
+    </p>
+  {% endif %}
+</div>
+
+{% if databases %}
+  <div class="card">
+    <h2>分库占用（按大小降序）</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>实例</th>
+            <th>库 / 维度</th>
+            <th>占用</th>
+            <th>占比</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in databases %}
+            <tr>
+              <td>{{ row.instance_name }}</td>
+              <td class="mono">{{ row.database }}</td>
+              <td data-bytes="{{ row.size|floatformat:"0" }}">{{ row.size|floatformat:"0" }} B</td>
+              <td>
+                {% if totals.instance_sum > 0 %}
+                  <div class="bar">
+                    <span style="width: {% widthratio row.size totals.instance_sum 100 %}%"></span>
+                  </div>
+                  <span class="muted small">{% widthratio row.size totals.instance_sum 100 %}%</span>
+                {% else %}
+                  <span class="muted">—</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endif %}
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{% static 'js/bytes.js' %}" defer></script>
+{% endblock %}

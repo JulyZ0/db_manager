@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}事件中心 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>事件中心</h1>
+    <div class="sub">
+      触发中 {{ counts.firing }} 条 · 已恢复 {{ counts.resolved }} 条
+      · 默认只显示触发中的事件
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn btn-primary" href="{% url 'web:alert_rules' %}">告警规则</a>
+    <a class="btn" href="{% url 'web:monitor_dashboard' %}">监控大盘</a>
+  </div>
+</div>
+
+<div class="card">
+  <form method="get" class="filters">
+    <div class="field">
+      <label for="status">状态</label>
+      <select id="status" name="status" onchange="this.form.submit()">
+        <option value="firing" {% if status == "firing" %}selected{% endif %}>触发中</option>
+        <option value="resolved" {% if status == "resolved" %}selected{% endif %}>已恢复</option>
+        <option value="all" {% if status == "all" %}selected{% endif %}>全部</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="severity">级别</label>
+      <select id="severity" name="severity" onchange="this.form.submit()">
+        <option value="">全部</option>
+        {% for value, label in severity_choices %}
+          <option value="{{ value }}" {% if severity == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="instance_id">实例</label>
+      <select id="instance_id" name="instance_id" onchange="this.form.submit()">
+        <option value="">全部实例</option>
+        {% for inst in instances %}
+          <option value="{{ inst.id }}" {% if instance_id == inst.id|stringformat:"s" %}selected{% endif %}>{{ inst.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <noscript><button class="btn" type="submit">筛选</button></noscript>
+  </form>
+</div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>状态</th><th>级别</th><th>规则</th><th>实例</th>
+          <th>触发条件</th><th>事实值</th><th>开始时间</th><th>最近命中</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for event in events %}
+          <tr>
+            <td>
+              {% if event.status == "firing" %}
+                <span class="badge badge-red">触发中</span>
+              {% else %}
+                <span class="badge badge-gray">已恢复</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if event.severity == "critical" %}
+                <span class="badge badge-red">严重</span>
+              {% else %}
+                <span class="badge badge-amber">警告</span>
+              {% endif %}
+            </td>
+            <td>{{ event.rule_name }}</td>
+            <td>
+              {% if event.instance_id %}
+                <a href="{% url 'web:instance_profile' event.instance_id %}">{{ event.instance_label }}</a>
+              {% else %}
+                {{ event.instance_label }}
+              {% endif %}
+            </td>
+            <td class="mono small">{{ event.metric }} {{ event.threshold|floatformat:"-2" }}</td>
+            <td>
+              <strong>{{ event.latest_value|floatformat:"-2" }}</strong>
+              {% if event.status == "firing" and event.latest_value != event.trigger_value %}
+                <div class="muted small">触发时 {{ event.trigger_value|floatformat:"-2" }}</div>
+              {% endif %}
+            </td>
+            <td class="mono small">{{ event.started_at|date:"m-d H:i:s" }}</td>
+            <td class="mono small">
+              {{ event.last_seen_at|date:"m-d H:i:s" }}
+              {% if event.resolved_at %}
+                <div class="muted">恢复 {{ event.resolved_at|date:"m-d H:i" }}</div>
+              {% endif %}
+            </td>
+          </tr>
+        {% empty %}
+          <tr>
+            <td colspan="8" class="empty">
+              {% if status == "firing" %}
+                当前没有触发中的告警。
+              {% else %}
+                没有符合筛选条件的告警事件。
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if page_obj.count > page_obj.page_size %}
+    <div class="pager">
+      <span class="muted small">共 {{ page_obj.count }} 条，第 {{ page_obj.page }} 页</span>
+      {% if page_obj.has_prev %}
+        <a class="btn btn-sm" href="?status={{ status }}&severity={{ severity }}&instance_id={{ instance_id }}&page={{ page_obj.page|add:"-1" }}">上一页</a>
+      {% endif %}
+      {% if page_obj.has_next %}
+        <a class="btn btn-sm" href="?status={{ status }}&severity={{ severity }}&instance_id={{ instance_id }}&page={{ page_obj.page|add:"1" }}">下一页</a>
+      {% endif %}
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

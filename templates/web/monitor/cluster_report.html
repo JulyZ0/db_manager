@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}{{ cluster.name }} · 集群诊断报告{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ cluster.name }} · 集群诊断报告</h1>
+    <div class="sub">
+      {{ cluster.department.name }} · {{ cluster.get_engine_display }}
+      · 生成于 {{ generated_at|date:"Y-m-d H:i:s" }}
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" type="button" onclick="location.reload()">重新生成</button>
+    <a class="btn" href="{% url 'web:inspect_overview' %}">巡检总览</a>
+    <a class="btn" href="{% url 'web:cluster_overview' cluster.id %}">集群概览</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>集群总评</h2>
+  <div class="cards">
+    <div class="stat-card">
+      <div class="label">平均健康分</div>
+      <div class="value">{{ average }}</div>
+      <div class="hint">仅统计数据充足的实例</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">实例数</div>
+      <div class="value">{{ reports|length }}</div>
+      <div class="hint">含停用实例</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">数据不足</div>
+      <div class="value">{{ insufficient_count }}</div>
+      <div class="hint">不能据此下结论</div>
+    </div>
+    {% if worst %}
+      <div class="stat-card">
+        <div class="label">最需要处理</div>
+        <div class="value" style="font-size:20px">
+          <a href="{% url 'web:inspect_report' worst.instance_id %}">{{ worst.instance_name }}</a>
+        </div>
+        <div class="hint">{{ worst.score }} 分 · {{ worst.grade }}</div>
+      </div>
+    {% endif %}
+  </div>
+  <p class="muted small">
+    平均分按实例简单平均，不设加权：集群健康度没有客观权重，
+    编一个权重只会让数字看起来精确而实质任意。优先看「最需要处理」那一台。
+  </p>
+</div>
+
+<div class="card">
+  <h2>成员实例</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>实例</th><th>角色</th><th>分数</th><th>评级</th>
+          <th>通过/警告/失败/无数据</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for report in reports %}
+          <tr>
+            <td><a href="{% url 'web:inspect_report' report.instance_id %}">{{ report.instance_name }}</a></td>
+            <td class="small">
+              {% for inst in cluster.instances.all %}
+                {% if inst.pk == report.instance_id %}{{ inst.get_role_display }}{% endif %}
+              {% endfor %}
+            </td>
+            <td><strong>{{ report.score }}</strong></td>
+            <td>
+              {% if report.insufficient %}
+                <span class="badge badge-gray">数据不足</span>
+              {% elif report.score >= 90 %}
+                <span class="badge badge-green">{{ report.grade }}</span>
+              {% elif report.score >= 75 %}
+                <span class="badge badge-blue">{{ report.grade }}</span>
+              {% elif report.score >= 60 %}
+                <span class="badge badge-amber">{{ report.grade }}</span>
+              {% else %}
+                <span class="badge badge-red">{{ report.grade }}</span>
+              {% endif %}
+            </td>
+            <td class="small">
+              <span style="color:#15803d">{{ report.counts.ok }}</span> /
+              <span style="color:#b45309">{{ report.counts.warn }}</span> /
+              <span style="color:#b91c1c">{{ report.counts.fail }}</span> /
+              <span class="muted">{{ report.counts.unknown }}</span>
+            </td>
+            <td><a class="btn btn-sm" href="{% url 'web:inspect_report' report.instance_id %}">详情</a></td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="6" class="empty">该集群没有实例</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

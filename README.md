@@ -114,6 +114,40 @@ python manage.py ensure_admin --reset-password
 | 看昨天各部门有多少实例 | 「数量统计」→ 选日期 → 查询 |
 | 找出慢的请求 | 「慢请求」 |
 | 直接对某个库执行 SQL | 左侧「控制台」→ `list` 看实例 → `use <id>` → 输入 SQL 回车 |
+| 看某台实例当前什么状况 | 「实例」→ 详情页 → 「监控」→ 实时性能 |
+| 看某台实例最近几小时的曲线 | 实例详情 → 「监控」→ 性能趋势（可切 1 小时 ~ 30 天） |
+| 看谁在等锁、有没有死锁 | 实例监控页 → 「锁分析」 |
+| 找出最耗时的 SQL | 实例监控页 → 「SQL 洞察」，可切总耗时 / 单次平均 / 执行次数 |
+| 一眼看全站有没有事 | 左侧「监控大盘」：只列有问题的实例 |
+| 配一条「连接数超 80% 就通知我」 | 「告警」→「告警规则」→ 新增规则 |
+| 今天该先修哪台机器 | 左侧「巡检评分」：按分数升序，最该修的排最前 |
+| 要对某个库做整体体检 | 集群详情 → 「监控」→ 集群概览 → 诊断报告 |
+
+### 3.2 监控与告警怎么用
+
+监控数据来自**目标库自身**，因此实例必须已登记密码、且账号有权读取统计视图：
+
+| 引擎 | 需要的权限 / 开关 |
+|---|---|
+| MySQL | 可读 `information_schema`、`performance_schema` |
+| PostgreSQL | 可读 `pg_stat_activity`、`pg_database_size`；SQL 洞察需 `pg_stat_statements` 扩展 |
+| Redis | 账号可执行 `INFO`；SQL 洞察走 `INFO commandstats` |
+
+三件容易踩的事：
+
+1. **采集周期最短 1 分钟**。写 0 会让任务永不触发（调度器按分钟去重）。
+2. **页面显示「尚无采集记录」不是故障**，多半是刚加实例，等一轮即可。
+   若长期如此，看「监控大盘」的「需要关注的实例」，那里直接给出错误码。
+3. **告警不会因为「连不上」而响**。连不上目标库时没有指标可评，
+   这类问题在「监控大盘」里以采集失败的形式列出，不走阈值规则。
+
+可选的 webhook 通知（企业微信 / 钉钉 / 飞书群机器人）：
+
+```ini
+MONITOR_ALERT_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+```
+
+只推「新触发」与「恢复」两类事件，不重复推送——否则持续越界的指标会每分钟推一条。
 
 ### 3.1 控制台怎么用
 
@@ -210,9 +244,28 @@ db_manager/
 │   │   ├── tasks.py          ✅ Celery 包装层
 │   │   ├── api.py            ✅
 │   │   └── management/commands/aggregate_instance_stats.py  ✅
+│   ├── monitor/              # 监控：采集 / 告警 / SQL 洞察 / 锁 / 巡检
+│   │   ├── models.py         ✅ MetricSample / CollectionRun / AlertRule /
+│   │   │                        AlertEvent / SqlDigest / LockWait / DeadlockEvent
+│   │   ├── collectors/       ✅ base + mysql / postgresql / redis_collector
+│   │   ├── services.py       ✅ 采集编排、速率换算、保留期清理
+│   │   ├── tasks.py          ✅ 采集 / 清理 / 告警评估 / 锁采集
+│   │   ├── queries.py        ✅ 时序查询与降采样
+│   │   ├── sqltext.py        ✅ SQL 归一化 + sha1 指纹
+│   │   ├── sql_collector.py  ✅ 三引擎语句统计采集
+│   │   ├── lock_collector.py ✅ 锁等待与死锁采集
+│   │   ├── alerting.py       ✅ 阈值评估（持续时长 / 冷却 / 自动收敛）
+│   │   ├── notify.py         ✅ webhook 通知
+│   │   ├── inspect.py        ✅ 巡检评分（纯函数）
+│   │   ├── reports.py        ✅ 诊断报告取数
+│   │   ├── catalog.py        ✅ 指标目录
+│   │   └── api.py            ✅ 时序 / 最新值 / 采集状态
 │   └── web/                  # 服务端渲染界面
-│       ├── forms.py          ✅ 3 个 ModelForm
-│       ├── views.py          ✅ 13 个视图
+│       ├── forms.py          ✅ 4 个 ModelForm
+│       ├── views.py          ✅ 资产管理视图
+│       ├── monitor_views.py  ✅ 集群监控 / 大盘 / 画像 / SQL / 锁 / 巡检
+│       ├── monitor_instance_views.py  ✅ 实例级五个监控页
+│       ├── monitor_alert_views.py     ✅ 事件中心与规则管理
 │       └── urls.py           ✅
 ├── common/timing.py          ✅ 计时组件（中间件与任务共用）
 ├── templates/                # base + 各类页面模板
@@ -354,7 +407,7 @@ celery -A config beat -l info
 
 ```bash
 python manage.py check         # 装配检查
-python -m pytest tests/ -q     # 全部测试（277 项）
+python -m pytest tests/ -q     # 全部测试
 python launcher.py --check     # 启动器环境自检
 ```
 
@@ -375,6 +428,10 @@ python launcher.py --check     # 启动器环境自检
 | GET | `/api/v1/instances/{id}/rotations` | 轮换历史 |
 | GET | `/api/v1/stats/daily` | 按日期查询统计快照 |
 | POST | `/api/v1/stats/daily/rebuild` | 重算某日统计（幂等） |
+| GET | `/api/v1/monitor/series` | 指标时序（自动按跨度降采样） |
+| GET | `/api/v1/monitor/latest` | 指标最新值 |
+| GET | `/api/v1/monitor/collect-status` | 最近一次采集状态 |
+| GET | `/api/v1/monitor/engines` | 指标目录 |
 
 实例相关的**任何响应都不包含密码或密文**，只暴露 `password_set` 与 `password_version`。
 

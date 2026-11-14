@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}锁分析{% if instance %} · {{ instance.name }}{% endif %} · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>锁分析{% if instance %} · {{ instance.name }}{% endif %}</h1>
+    <div class="sub">
+      {% if instance %}
+        {{ instance.cluster.name }} · {{ instance.cluster.get_engine_display }}
+      {% else %}
+        全库视图 · 只展示各实例**当前**的锁等待
+      {% endif %}
+      · 锁采集周期 {{ lock_interval }} 分钟
+    </div>
+  </div>
+  <div class="actions">
+    {% if instance %}
+      <a class="btn" href="{% url 'web:instance_trend' instance.id %}">性能趋势</a>
+      <a class="btn" href="{% url 'web:lock_analysis' %}">全库视图</a>
+    {% else %}
+      <a class="btn" href="{% url 'web:monitor_dashboard' %}">监控大盘</a>
+    {% endif %}
+  </div>
+</div>
+
+{% if not lock_supported %}
+  <div class="card">
+    <div class="alert alert-warning">
+      「{{ instance.cluster.get_engine_display }}」没有行锁等待的概念，
+      锁分析对它不适用。当前仅 MySQL / PostgreSQL 支持锁采集。
+    </div>
+  </div>
+{% else %}
+
+<div class="card">
+  <h2>当前锁等待（{{ waits|length }} 条）</h2>
+  {% if not has_waiters %}
+    <p class="muted">
+      当前没有锁等待。
+      {% if instance %}
+        这可能是真的没有，也可能是锁采集尚未运行过——
+        采集周期是 {{ lock_interval }} 分钟。
+      {% endif %}
+    </p>
+  {% else %}
+    <p class="muted small">
+      锁等待是瞬时状态，每轮采集会整体刷新。等得最久的排在最前面。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {% if not instance %}<th>实例</th>{% endif %}
+            <th>等待方</th>
+            <th>阻塞方</th>
+            <th>锁类型</th>
+            <th>对象</th>
+            <th>已等待</th>
+            <th>等待中的语句</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in waits %}
+            <tr>
+              {% if not instance %}
+                <td><a href="{% url 'web:instance_lock_analysis' row.instance_id %}">{{ row.instance.name }}</a></td>
+              {% endif %}
+              <td class="mono small">{{ row.waiting_label }}</td>
+              <td class="mono small">{{ row.blocking_label }}</td>
+              <td class="small">{{ row.lock_type|default:"—" }}</td>
+              <td class="mono small">{{ row.relation|default:"—" }}</td>
+              <td>
+                {% if row.wait_seconds %}
+                  <strong>{{ row.wait_seconds|floatformat:"0" }} s</strong>
+                {% else %}
+                  <span class="muted" title="MySQL 的 data_lock_waits 不提供等待时长">—</span>
+                {% endif %}
+              </td>
+              <td class="mono small" style="max-width:420px;word-break:break-all">
+                {{ row.query|default:"—" }}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>死锁历史（最近 {{ deadlocks|length }} 条）</h2>
+  {% if not deadlocks %}
+    <p class="muted">
+      没有记录到死锁。死锁是已发生的事件，按累计计数增量留档；
+      若目标库从未发生过死锁，这里会一直为空。
+    </p>
+  {% else %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {% if not instance %}<th>实例</th>{% endif %}
+            <th>发现时刻</th>
+            <th>累计死锁数</th>
+            <th>死锁摘要</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in deadlocks %}
+            <tr>
+              {% if not instance %}
+                <td><a href="{% url 'web:instance_lock_analysis' row.instance_id %}">{{ row.instance.name }}</a></td>
+              {% endif %}
+              <td class="mono small">{{ row.detected_at|date:"Y-m-d H:i:s" }}</td>
+              <td>{{ row.deadlock_total }}</td>
+              <td>
+                {% if row.detail %}
+                  <details>
+                    <summary class="muted small">展开原文</summary>
+                    <pre class="deadlock-detail">{{ row.detail }}</pre>
+                  </details>
+                {% else %}
+                  <span class="muted">—</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
+{% endif %}
+{% endblock %}

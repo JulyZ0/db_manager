@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ instance.name }} · 实例会话{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ instance.name }} · 实例会话</h1>
+    <div class="sub">
+      {{ instance.cluster.name }} · {{ instance.cluster.get_engine_display }}
+      · 查询时间 {{ checked_at|date:"Y-m-d H:i:s" }}
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" type="button" onclick="location.reload()">刷新</button>
+    <a class="btn" href="{% url 'web:instance_realtime' instance.id %}">实时性能</a>
+    <a class="btn" href="{% url 'web:instance_detail' instance.id %}">实例详情</a>
+  </div>
+</div>
+
+{# 目标库不可达是运维最需要看到的状态：这里如实展示原因，不隐藏、不 500 #}
+{% if not result.ok %}
+  <div class="card">
+    <div class="alert alert-error">
+      无法获取会话列表：<code>{{ result.error }}</code>
+      {% if result.message %} — {{ result.message }}{% endif %}
+      {% if result.hint %}<div class="muted small">{{ result.hint }}</div>{% endif %}
+    </div>
+    <p class="muted small">
+      该页面每次打开都会实时连接目标库；连不上时请先确认网络可达与账号凭据。
+    </p>
+  </div>
+{% else %}
+  <div class="card">
+    <h2>当前会话（{{ result.rows|length }} 条）</h2>
+    {% if result.truncated %}
+      <div class="alert alert-warning">结果超过单次返回上限，已截断显示。</div>
+    {% endif %}
+    {% if not result.rows %}
+      <p class="muted">当前没有活动会话。</p>
+    {% else %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              {% for col in result.columns %}<th>{{ col }}</th>{% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in result.rows %}
+              <tr>
+                {% for cell in row %}<td class="mono">{{ cell }}</td>{% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </div>
+{% endif %}
+{% endblock %}

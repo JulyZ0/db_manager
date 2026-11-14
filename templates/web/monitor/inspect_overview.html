@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}巡检评分 · 数据库实例管理系统{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>巡检评分</h1>
+    <div class="sub">
+      共 {{ summary.total }} 台启用实例 · 平均 {{ summary.average }} 分
+      · 低于 60 分 {{ summary.poor }} 台
+      {% if summary.insufficient %}· 数据不足 {{ summary.insufficient }} 台{% endif %}
+      · 按分数升序，最该修的排在最前
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" type="button" onclick="location.reload()">重新巡检</button>
+    <a class="btn" href="{% url 'web:monitor_dashboard' %}">监控大盘</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>评分说明</h2>
+  <p class="muted small">
+    每台实例按采集状态、凭据登记、连接使用率、缓存命中率、慢查询、复制延迟、
+    锁等待、告警状态共 8 项评分，分段线性折算后加权汇总。
+    某一项没有数据时**跳过该项**而不是记 0 分；若所有指标类检查都没有数据，
+    分数封顶并标记为「数据不足」——此时分数不代表健康度，只表示还无从判断。
+  </p>
+</div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>实例</th><th>集群</th><th>引擎</th><th>分数</th>
+          <th>评级</th><th>通过/警告/失败/无数据</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          <tr>
+            <td><a href="{% url 'web:inspect_report' row.report.instance_id %}">{{ row.report.instance_name }}</a></td>
+            <td class="small">
+              {{ row.instance.cluster.name }}
+              <div class="muted">{{ row.instance.cluster.department.name }}</div>
+            </td>
+            <td class="mono small">{{ row.report.engine }}</td>
+            <td>
+              <strong style="font-size:16px">{{ row.report.score }}</strong>
+            </td>
+            <td>
+              {% if row.report.insufficient %}
+                <span class="badge badge-gray">数据不足</span>
+              {% elif row.report.score >= 90 %}
+                <span class="badge badge-green">{{ row.report.grade }}</span>
+              {% elif row.report.score >= 75 %}
+                <span class="badge badge-blue">{{ row.report.grade }}</span>
+              {% elif row.report.score >= 60 %}
+                <span class="badge badge-amber">{{ row.report.grade }}</span>
+              {% else %}
+                <span class="badge badge-red">{{ row.report.grade }}</span>
+              {% endif %}
+            </td>
+            <td class="small">
+              <span style="color:#15803d">{{ row.report.counts.ok }}</span> /
+              <span style="color:#b45309">{{ row.report.counts.warn }}</span> /
+              <span style="color:#b91c1c">{{ row.report.counts.fail }}</span> /
+              <span class="muted">{{ row.report.counts.unknown }}</span>
+            </td>
+            <td>
+              <a class="btn btn-sm" href="{% url 'web:inspect_report' row.report.instance_id %}">诊断报告</a>
+            </td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="7" class="empty">还没有启用的实例，无法巡检</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

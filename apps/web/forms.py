@@ -10,6 +10,7 @@ from __future__ import annotations
 from django import forms
 
 from apps.assets.models import Cluster, Department, Instance
+from apps.monitor.models import AlertRule
 from apps.credentials.models import (
     MAX_INTERVAL_HOURS,
     MIN_INTERVAL_HOURS,
@@ -443,3 +444,72 @@ class ChangePasswordForm(BootstrapMixin, forms.Form):
 
         return cleaned
 
+
+
+class AlertRuleForm(BootstrapMixin, forms.ModelForm):
+    """告警规则表单。
+
+    ``metric`` 用下拉而不是自由文本：指标键（``mysql.qps``）拼错一个字符，
+    规则就会永远不触发，而页面上看不出任何异常。下拉把可选值限定在
+    系统真实采集的清单里。
+
+    已存在但不在目录中的旧指标键要补进选项，否则编辑旧规则时下拉会
+    "选不中"，保存后等于悄悄改掉了规则指向的指标。
+    """
+
+    class Meta:
+        model = AlertRule
+        fields = [
+            "name",
+            "metric",
+            "operator",
+            "threshold",
+            "duration_minutes",
+            "severity",
+            "cluster",
+            "cooldown_minutes",
+            "enabled",
+            "remark",
+        ]
+        labels = {
+            "name": "规则名称",
+            "metric": "监控指标",
+            "operator": "比较方式",
+            "threshold": "阈值",
+            "duration_minutes": "持续时长（分钟）",
+            "severity": "告警级别",
+            "cluster": "限定集群",
+            "cooldown_minutes": "恢复后冷却（分钟）",
+            "enabled": "启用",
+            "remark": "备注",
+        }
+        help_texts = {
+            "name": "全局唯一，便于在事件列表里辨认",
+            "threshold": "与指标同单位；命中方式由「比较方式」决定",
+            "duration_minutes": "0 表示一越界就告警；大于 0 时需持续越界满该时长",
+            "cluster": "留空表示对所有集群生效",
+            "cooldown_minutes": "恢复后这段时间内不再重复告警，避免阈值附近抖动刷屏",
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        from apps.monitor.catalog import metric_choices
+
+        choices = metric_choices()
+        current = None
+        if self.instance and self.instance.pk:
+            current = self.instance.metric
+        elif self.initial.get("metric"):
+            current = self.initial["metric"]
+
+        # 旧指标键不在目录里时补一项，避免编辑时被"修正"成别的指标
+        known = {value for value, _label in choices}
+        if current and current not in known:
+            choices.insert(0, (current, f"{current}（已不在指标目录中）"))
+        self.fields["metric"] = forms.ChoiceField(
+            label="监控指标",
+            choices=choices,
+            initial=current,
+            help_text="只列出系统当前会采集的指标",
+        )

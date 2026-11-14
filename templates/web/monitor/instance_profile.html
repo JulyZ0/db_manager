@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ instance.name }} · 实例画像{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ instance.name }}{% if instance.alias %} <span class="muted small mono">({{ instance.alias }})</span>{% endif %} · 实例画像</h1>
+    <div class="sub">
+      {{ instance.cluster.department.name }} / {{ instance.cluster.name }}
+      · {{ instance.cluster.get_engine_display }}
+      · {{ instance.cluster.get_env_display }}
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn btn-primary" href="{% url 'web:instance_trend' instance.id %}">性能趋势</a>
+    <a class="btn" href="{% url 'web:instance_realtime' instance.id %}">实时性能</a>
+    <a class="btn" href="{% url 'web:instance_sessions' instance.id %}">会话</a>
+    <a class="btn" href="{% url 'web:instance_slowlog' instance.id %}">慢日志</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>基本属性</h2>
+  <dl class="kv">
+    <dt>连接地址</dt>
+    <dd class="mono">{{ instance.host }}:{{ instance.port }}</dd>
+    <dt>引擎 / 环境</dt>
+    <dd>{{ instance.cluster.get_engine_display }} · {{ instance.cluster.get_env_display }}</dd>
+    <dt>集群架构</dt>
+    <dd>{{ instance.cluster.get_topology_display }}</dd>
+    <dt>角色</dt>
+    <dd>{{ instance.get_role_display }}</dd>
+    <dt>复制上游</dt>
+    <dd>
+      {% if instance.replica_of %}
+        <a href="{% url 'web:instance_profile' instance.replica_of.id %}">{{ instance.replica_of.name }}</a>
+      {% else %}<span class="muted">—</span>{% endif %}
+    </dd>
+    <dt>启用状态</dt>
+    <dd>
+      {% if instance.is_active %}
+        <span class="badge badge-green">启用</span>
+      {% else %}
+        <span class="badge badge-gray">停用</span>
+      {% endif %}
+      {% if instance.status == "online" %}
+        <span class="badge badge-green">在线</span>
+      {% elif instance.status == "offline" %}
+        <span class="badge badge-red">离线</span>
+      {% else %}
+        <span class="badge badge-gray">未探测</span>
+      {% endif %}
+    </dd>
+    <dt>凭据</dt>
+    <dd>
+      {% if instance.password_set %}
+        <span class="badge badge-green">已登记</span>
+        <span class="muted small mono">{{ instance.username }}</span>
+        {% if instance.password_updated_at %}
+          <span class="muted small">更新于 {{ instance.password_updated_at|date:"Y-m-d H:i" }}</span>
+        {% endif %}
+      {% else %}
+        <span class="badge badge-amber">未登记密码</span>
+      {% endif %}
+    </dd>
+    {% if instance.remark %}
+      <dt>备注</dt><dd>{{ instance.remark }}</dd>
+    {% endif %}
+  </dl>
+</div>
+
+<div class="card">
+  <h2>采集状态</h2>
+  {% if not run %}
+    <div class="alert alert-info">尚无采集记录。</div>
+  {% elif not run.ok %}
+    <div class="alert alert-error">
+      最近一次采集失败（{{ run.collected_at|date:"Y-m-d H:i:s" }}）：
+      <code>{{ run.error_code }}</code>
+      {% if run.message %} — {{ run.message }}{% endif %}
+    </div>
+  {% else %}
+    <div class="muted small">
+      {{ run.collected_at|date:"Y-m-d H:i:s" }} · {{ run.metrics_count }} 项指标 ·
+      耗时 {{ run.duration_ms }}ms
+    </div>
+  {% endif %}
+</div>
+
+{% if has_metrics %}
+  <div class="card">
+    <h2>核心指标（最近一次采样）</h2>
+    <div class="metric-grid">
+      {% for cell in cells %}
+        <div class="metric-cell">
+          <div class="metric-label">{{ cell.label }}</div>
+          <div class="metric-value">
+            {% if cell.value is None %}
+              <span class="muted">—</span>
+            {% elif cell.unit == "bytes" %}
+              <span data-bytes="{{ cell.value }}">{{ cell.value|floatformat:"0" }} B</span>
+            {% else %}
+              {{ cell.value|floatformat:"-2" }}{% if cell.unit %} <small>{{ cell.unit }}</small>{% endif %}
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+{% endif %}
+
+<div class="card">
+  <h2>同集群其它实例</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>实例</th><th>角色</th><th>地址</th><th>操作</th></tr></thead>
+      <tbody>
+        {% for sibling in siblings %}
+          <tr>
+            <td>{{ sibling.name }}</td>
+            <td>{{ sibling.get_role_display }}</td>
+            <td class="mono small">{{ sibling.host }}:{{ sibling.port }}</td>
+            <td><a class="btn btn-sm" href="{% url 'web:instance_profile' sibling.id %}">画像</a></td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="4" class="empty">该集群没有其它实例</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{% static 'js/bytes.js' %}" defer></script>
+{% endblock %}
