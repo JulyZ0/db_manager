@@ -20,3 +20,8 @@ htmlcov/
 .DS_Store
 .idea
 staticfiles/
+
+# Celery beat 的调度状态文件与 worker/beat 日志（由启动器生成）
+celerybeat-schedule*
+celery-worker.log
+celery-beat.log

@@ -48,6 +48,14 @@
     <dd>
       {% if scheduler_mode == "celery" %}
         <span class="badge badge-green">Celery</span> 已连接消息队列，按计划执行轮换与统计
+      {% elif scheduler_mode == "celery_no_worker" %}
+        <span class="badge badge-red">Celery 未就绪</span>
+        <div class="alert alert-error" style="margin-top:8px">
+          配置为使用 Celery，但当前没有检测到 worker 在消费任务，
+          <strong>定时任务不会执行</strong>（密码不会轮换、指标不会采集、告警不会评估）。
+          请确认 celery worker 与 beat 已启动，或把 <code>SCHEDULER_MODE</code>
+          改为 <code>auto</code> 由 Web 进程内调度兜底。
+        </div>
       {% elif scheduler_mode == "inprocess" %}
         <span class="badge badge-amber">进程内调度</span>
         没有检测到可用的 Celery worker（消息队列不可达或 worker 未启动），

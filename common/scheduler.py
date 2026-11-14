@@ -34,6 +34,12 @@ TICK_SECONDS = 15
 # 启动时确定下来的模式。cache 住是为了让页面渲染不必每次都探测 worker。
 _resolved_mode: str | None = None
 
+# worker 存活探测的缓存。页面渲染不能每次请求都 ping worker——
+# 一次探测要 0.5 秒，整站每个页面都会慢半秒。
+_worker_alive: bool = False
+_worker_checked_at: float = 0.0
+WORKER_CACHE_SECONDS = 30
+
 
 # ---------------------------------------------------------------------------
 # 模式判定
@@ -300,15 +306,53 @@ def start_scheduler_if_needed() -> str:
     return mode
 
 
+def worker_alive(timeout: float | None = None, *, force: bool = False) -> bool:
+    """是否有 celery worker 存活（带缓存）。
+
+    为什么要缓存
+    ------------
+    一次 ping 要等半秒超时。仪表盘每渲染一次就探一次，整站所有页面都会
+    慢半秒。缓存 30 秒既能把延迟摊薄到可忽略，又能在 worker 挂掉后
+    半分钟内反映出来——对「分钟级」的定时任务精度足够。
+
+    ``force=True`` 供需要即时结论的场景使用（如显式刷新）。
+    """
+    global _worker_alive, _worker_checked_at
+
+    now = time.monotonic()
+    if not force and (now - _worker_checked_at) < WORKER_CACHE_SECONDS:
+        return _worker_alive
+
+    _worker_alive = probe_worker(
+        timeout if timeout is not None
+        else getattr(settings, "SCHEDULER_WORKER_PROBE_TIMEOUT", 0.5)
+    )
+    _worker_checked_at = now
+    return _worker_alive
+
+
 def current_mode() -> str:
     """供页面展示当前调度模式。
 
-    优先用启动时确定的结果：``resolve_mode`` 在 auto 模式下会探测 worker，
-    每次请求都探一次会给每个页面白加半秒延迟。进程内调度器已运行时直接
-    返回 inprocess，也避免重复探测。
+    取值有三种：
+    - ``inprocess``：进程内调度器在跑，任务由本进程执行。
+    - ``celery``：Celery 模式，且**确有 worker 存活**在消费。
+    - ``celery_no_worker``：配置了 Celery，但没有 worker 在消费。
+
+    为什么要把第三种单列出来
+    ------------------------
+    显式 ``SCHEDULER_MODE=celery`` 时，我们尊重配置、不去偷偷改跑进程内
+    调度（那会造成"以为在 Celery 跑、实际在 Web 进程跑"，多进程部署还会
+    重复执行）。但若此时 worker 根本没起来，**任务就没有任何执行方**：
+    密码不轮换、指标不采集、告警不评估，而页面如果只显示绿色的
+    "Celery 已连接消息队列"，运维会以为一切正常。
+
+    这类沉默故障必须显式暴露，所以单列一个状态交给模板渲染成告警。
     """
     if _scheduler is not None and _scheduler.is_running():
         return "inprocess"
-    if _resolved_mode is not None:
-        return _resolved_mode
-    return resolve_mode()
+
+    mode = _resolved_mode if _resolved_mode is not None else resolve_mode()
+    if mode == "celery" and not worker_alive():
+        return "celery_no_worker"
+    return mode

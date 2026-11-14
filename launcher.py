@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -43,6 +44,12 @@ ENV_EXAMPLE = ROOT / ".env.example"
 
 MIN_PYTHON = (3, 14)
 DEFAULT_PORT = 8000
+
+# Celery worker 的并发数。采集要等目标库响应（网络 IO），线程池更合适；
+# Windows 上 celery 的 prefork 默认池不可用，必须显式 -P threads。
+CELERY_CONCURRENCY = 4
+# beat 的调度状态文件。显式落到项目根目录，避免散落在启动时的工作目录。
+CELERY_BEAT_SCHEDULE_FILE = ROOT / "celerybeat-schedule"
 PORT_SCAN_LIMIT = 20
 
 # 国内镜像：PyPI 直连经常超时，先走镜像，失败再回退官方源
@@ -591,6 +598,152 @@ def wait_until_ready(port: int, timeout: float = 45.0) -> bool:
     return False
 
 
+def _broker_reachable(url: str, timeout: float = 0.5) -> bool:
+    """启动器侧的 broker 可达性探测。
+
+    不能复用 ``common.scheduler.probe_broker``：这个时刻 Django settings
+    还没加载。判定规则刻意保持一致（只做 TCP 握手），避免启动器与 Web
+    进程对"能不能用 Celery"得出相反结论。
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("redis", "rediss", "amqp", "amqps"):
+        return False
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (6379 if parsed.scheme.startswith("redis") else 5672)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def want_celery() -> bool:
+    """启动器是否应该拉起 celery worker 与 beat。
+
+    - ``SCHEDULER_MODE=celery``：明确要求，必须拉起。
+    - ``SCHEDULER_MODE=inprocess``：明确不要。
+    - ``auto``：broker 可达就拉起——装了 Redis 的机器应当真的用上 Celery，
+      而不是"有 Redis 却在 Web 进程里跑定时任务"。不可达则不起，
+      保持"零配置也能跑"的承诺，由 Web 进程内调度兜底。
+    """
+    mode = (_env_file_get("SCHEDULER_MODE", "auto") or "auto").strip().lower()
+    if mode == "inprocess":
+        return False
+    if mode == "celery":
+        return True
+    return _broker_reachable(_env_file_get("CELERY_BROKER_URL", ""))
+
+
+def _celery_commands() -> list[tuple[str, list[str], str]]:
+    """要拉起的 celery 进程：(名称, 命令, 日志文件名)。"""
+    base = [sys.executable, "-m", "celery", "-A", "config"]
+    worker = base + [
+        "worker",
+        "-l",
+        "info",
+        # 轮换任务走 rotation 队列，其余走 default（见 settings.CELERY_TASK_ROUTES）
+        "-Q",
+        "default,rotation",
+        # Windows 上 celery 的 prefork 默认池不可用，必须显式线程池
+        "-P",
+        "threads",
+        "-c",
+        str(CELERY_CONCURRENCY),
+        # 每处理若干任务回收一次子线程，避免长跑进程内存缓慢增长
+        "--max-tasks-per-child",
+        "200",
+    ]
+    beat = base + [
+        "beat",
+        "-l",
+        "info",
+        "--schedule",
+        str(CELERY_BEAT_SCHEDULE_FILE),
+    ]
+    return [
+        ("worker", worker, "celery-worker.log"),
+        ("beat", beat, "celery-beat.log"),
+    ]
+
+
+def _log_tail(path: Path, lines: int = 15) -> str:
+    """取日志末尾若干行，用于把启动失败的原因直接显示给用户。"""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(content.splitlines()[-lines:])
+
+
+def start_celery() -> tuple[list[tuple[str, subprocess.Popen]], list[Path]]:
+    """拉起 worker 与 beat，返回 (已启动进程, 日志文件)。
+
+    顺序上 worker 先、beat 后：beat 只负责按点发任务，worker 才是执行方。
+
+    子进程输出重定向到日志文件而不是继承控制台：两个 celery 进程的
+    INFO 日志非常密，混进启动器界面会把关键提示冲掉；出问题时按提示
+    去看日志文件即可。
+
+    启动失败不抛异常、也不让整个服务起不来——定时任务降级由调用方处理。
+    """
+    started: list[tuple[str, subprocess.Popen]] = []
+    logs: list[Path] = []
+
+    for name, cmd, log_name in _celery_commands():
+        log_path = ROOT / log_name
+        logs.append(log_path)
+        try:
+            with open(log_path, "ab") as handle:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(ROOT),
+                    env=utf8_child_env(),
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                )
+        except OSError:
+            continue
+        started.append((name, proc))
+
+    # 给它们一点时间暴露启动期错误（缺依赖、配置错误、端口/文件占用）。
+    # 不这么做的话，进程秒退会被误当成"已启动"，页面转而显示一切正常。
+    time.sleep(2.5)
+    healthy: list[tuple[str, subprocess.Popen]] = []
+    for name, proc in started:
+        if proc.poll() is not None:
+            log_path = ROOT / f"celery-{name}.log"
+            info(f"celery {name} 启动失败（退出码 {proc.returncode}），日志：{log_path}")
+            tail = _log_tail(log_path)
+            if tail:
+                print(tail, flush=True)
+            continue
+        healthy.append((name, proc))
+
+    return healthy, logs
+
+
+def stop_processes(procs: list[tuple[str, subprocess.Popen]]) -> None:
+    """终止一组子进程（先温和，再强杀）。
+
+    必须显式清理：celery 的 worker/beat 不会因为父进程退出而自动结束，
+    残留下来会和下次启动的实例抢同一批任务与 beat 调度文件。
+    """
+    for name, proc in procs:
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                info(f"{name} 进程未能正常退出，请手动结束")
+        except OSError:
+            pass
+
+
 def serve(port: int, open_browser: bool) -> int:
     host = bind_host()
     url = browse_url(host, port)
@@ -625,6 +778,30 @@ def serve(port: int, open_browser: bool) -> int:
     print("  关闭窗口或按 Ctrl+C 即可停止服务", flush=True)
     print("=" * 58 + "\n", flush=True)
 
+    # ------------------------------------------------------------------
+    # 先起 celery，再起 Web。
+    #
+    # 顺序很关键：Web 启动时 auto 模式会探测"有没有 worker 在消费"，
+    # 若 worker 还没起来就会降级为进程内调度——那就等于没用上 Celery。
+    # ------------------------------------------------------------------
+    celery_procs: list[tuple[str, subprocess.Popen]] = []
+    if want_celery():
+        info("正在启动 Celery worker 与 beat（定时任务由它们执行）...")
+        celery_procs, celery_logs = start_celery()
+        if celery_procs:
+            names = "、".join(name for name, _ in celery_procs)
+            info(f"Celery 已启动：{names}")
+            info(f"日志：{'、'.join(str(p) for p in celery_logs)}")
+        else:
+            # 起不来不能挡住 Web：否则运维连界面都打不开，更没法排查。
+            # Web 侧会因探测不到 worker 自动降级为进程内调度，任务照常执行。
+            info(
+                "Celery 未能启动，本次改由 Web 进程内调度执行定时任务；"
+                "排查后可重启，详见上方日志路径"
+            )
+    else:
+        info("未启用 Celery，定时任务由 Web 进程内调度执行")
+
     # 用子进程而不是同进程调用，Ctrl+C 时才能干净地连带退出
     proc = subprocess.Popen(cmd, cwd=str(ROOT), env=utf8_child_env())
 
@@ -646,6 +823,10 @@ def serve(port: int, open_browser: bool) -> int:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        # celery 进程不会随父进程退出而自动结束，必须显式清理：
+        # 残留下来会和下次启动的实例抢同一批任务与 beat 调度文件。
+        if celery_procs:
+            stop_processes(celery_procs)
 
 
 # ---------------------------------------------------------------------------

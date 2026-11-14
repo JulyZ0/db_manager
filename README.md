@@ -319,6 +319,8 @@ errno 常量用 `hasattr` 过滤，避免在部分平台上 import 即失败。
 ### 2.3 已完成的装配
 
 - **调度三模式**：`SCHEDULER_MODE=auto|celery|inprocess`。`auto` 会在启动时探测
+  broker **并向 worker 发 ping**（只有 broker 通、worker 也回应才判定为 Celery，
+  否则 Redis 起着而 worker 没起时，定时任务会静默不执行）
   broker（0.3 秒超时），连不上就自动降级为进程内线程调度，**与 Celery 共用同一批任务函数**
 - **配置分层**：`DB_ENGINE=sqlite|postgresql` 切换，无需改代码
 - **密钥校验**：`FIELD_ENCRYPTION_KEY` 缺失或格式非法 → 启动即失败，不降级明文
@@ -345,14 +347,27 @@ python manage.py runserver
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-需要 Celery 模式时（可选，需要 Redis）：
+#### Celery 由启动器自动托管
+
+`python launcher.py`（或双击 `start.bat`）在起 Web 之前会**自动拉起
+celery worker 与 beat**，无需手工开两个终端：
+
+- `SCHEDULER_MODE=celery`：一定拉起，起不来会打印日志路径。
+- `SCHEDULER_MODE=auto`：Redis 可达就拉起；不可达则跳过，由 Web 进程内调度兜底。
+- `SCHEDULER_MODE=inprocess`：不拉起。
+
+worker 与 beat 的输出分别写到 `celery-worker.log` / `celery-beat.log`
+（已 gitignore）。关闭启动器时它们会被一并终止。
+
+也可以手工管理（例如拆到不同机器上跑）：
 
 ```bash
-celery -A config worker -l info -Q default,rotation
-celery -A config beat -l info
+celery -A config worker -l info -Q default,rotation -P threads -c 4
+celery -A config beat -l info --schedule celerybeat-schedule
 ```
 
-无 Redis 时保持 `SCHEDULER_MODE=auto` 即可，定时任务照常执行。
+> Windows 上必须带 `-P threads`：celery 默认的 prefork 池在 Windows 不可用。
+> `beat` 全局只能有**一个**实例，多开会重复投递任务。
 
 ### 2.5 多进程部署（重要约束）
 
@@ -380,14 +395,18 @@ celery -A config beat -l info
    注意这个缓存也会被其它缓存用途共用。
 
 2. **定时任务交给 Celery。** 设 `SCHEDULER_MODE=celery`（缺 Redis 会直接报错，
-   而不是悄悄降级成进程内模式），然后单独跑：
+   而不是悄悄降级成进程内模式）。`launcher.py` 会自动托管 worker 与 beat；
+   若要把它们拆到独立机器，手工启动即可：
 
    ```bash
-   celery -A config worker -l info -Q default,rotation
-   celery -A config beat -l info
+   celery -A config worker -l info -Q default,rotation -P threads -c 4
+   celery -A config beat -l info --schedule celerybeat-schedule
    ```
 
    `beat` 全局只能有**一个**实例，多开会重复投递任务。
+
+   > 配了 `celery` 但 worker 没起来时，仪表盘会显示红色的「Celery 未就绪」
+   > 并明确说明定时任务不会执行——这类沉默停摆必须让人一眼看到。
 
 3. **确认调度器没被意外拉起。** 多 worker 部署下可以用
    `DISABLE_SCHEDULER=1` 在 Web 进程里彻底关掉进程内调度器，把触发权完全交给

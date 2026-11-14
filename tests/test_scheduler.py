@@ -199,3 +199,160 @@ def test_probe_worker_returns_false_on_error(monkeypatch):
 
     monkeypatch.setattr("config.celery.app", Boom(), raising=False)
     assert scheduler_mod.probe_worker(timeout=0.01) is False
+
+
+# ---------------------------------------------------------------------------
+# celery 进程不得启动进程内调度器
+# ---------------------------------------------------------------------------
+
+
+class TestCeleryProcessDetection:
+    """celery 的 worker / beat 也会加载 Django，必须排除。
+
+    不排除的后果是「同一任务执行两遍」：轮换给同一实例改两次密码、
+    采集写两份指标、告警重复触发。实测 worker 日志里曾出现
+    「进程内调度器已启动，共 7 个周期任务」，就是缺这道判断。
+    """
+
+    def test_detects_windows_celery_exe(self):
+        from apps.runtime.apps import is_celery_process
+
+        assert is_celery_process([r"X:\p\.venv\Scripts\celery.exe", "-A", "config", "worker"])
+        assert is_celery_process([r"X:\p\.venv\Scripts\celery.exe", "-A", "config", "beat"])
+
+    def test_detects_posix_celery(self):
+        from apps.runtime.apps import is_celery_process
+
+        assert is_celery_process(["/app/.venv/bin/celery", "-A", "config", "worker"])
+
+    def test_detects_python_dash_m_celery(self):
+        """python -m celery worker 时 argv[0] 是 celery 包内的 __main__.py。"""
+        from apps.runtime.apps import is_celery_process
+
+        assert is_celery_process(["/usr/lib/python3.12/celery/__main__.py", "worker"])
+
+    def test_web_and_launcher_are_not_celery(self):
+        from apps.runtime.apps import is_celery_process
+
+        assert not is_celery_process([r"X:\p\.venv\Scripts\python.exe", "launcher.py"])
+        assert not is_celery_process([r"X:\p\.venv\Scripts\python.exe", "manage.py", "runserver"])
+        assert not is_celery_process(["config.wsgi:application"])
+
+    def test_empty_argv_is_not_celery(self):
+        from apps.runtime.apps import is_celery_process
+
+        assert not is_celery_process([])
+
+    def test_scheduler_not_started_under_celery(self, monkeypatch):
+        """端到端断言：celery 进程下 should_start_scheduler() 必须为 False。"""
+        import sys as _sys
+
+        from apps.runtime import apps as runtime_apps
+
+        monkeypatch.setattr(
+            _sys, "argv", [r"X:\p\.venv\Scripts\celery.exe", "-A", "config", "worker"]
+        )
+        monkeypatch.delenv("DISABLE_SCHEDULER", raising=False)
+        assert runtime_apps.should_start_scheduler() is False
+
+
+# ---------------------------------------------------------------------------
+# worker 存活与「Celery 未就绪」状态
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerLiveness:
+    """显式 SCHEDULER_MODE=celery 但 worker 没起时，必须能看出来。
+
+    这是最危险的组合：我们尊重配置不去偷偷改跑进程内调度（否则会造成
+    "以为在 Celery 跑、实际在 Web 进程跑"，多进程部署还会重复执行），
+    但此时**没有任何执行方**——密码不轮换、指标不采集、告警不评估。
+    页面若仍显示绿色"已连接消息队列"，运维会以为一切正常。
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_cache(self, monkeypatch):
+        """每个用例都从干净的缓存开始，避免相互串味。"""
+        from common import scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod, "_worker_alive", False)
+        monkeypatch.setattr(scheduler_mod, "_worker_checked_at", 0.0)
+        monkeypatch.setattr(scheduler_mod, "_resolved_mode", None)
+        monkeypatch.setattr(scheduler_mod, "_scheduler", None)
+
+    def test_worker_alive_delegates_to_probe(self, monkeypatch):
+        from common import scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod, "probe_worker", lambda *a, **k: True)
+        assert scheduler_mod.worker_alive(force=True) is True
+
+        monkeypatch.setattr(scheduler_mod, "probe_worker", lambda *a, **k: False)
+        assert scheduler_mod.worker_alive(force=True) is False
+
+    def test_worker_alive_is_cached(self, monkeypatch):
+        """页面渲染不能每次请求都 ping：一次探测半秒，整站都慢半秒。"""
+        from common import scheduler as scheduler_mod
+
+        calls = []
+        monkeypatch.setattr(
+            scheduler_mod, "probe_worker", lambda *a, **k: calls.append(1) or True
+        )
+
+        scheduler_mod.worker_alive(force=True)
+        scheduler_mod.worker_alive()
+        scheduler_mod.worker_alive()
+
+        assert len(calls) == 1
+
+    def test_force_bypasses_cache(self, monkeypatch):
+        from common import scheduler as scheduler_mod
+
+        calls = []
+        monkeypatch.setattr(
+            scheduler_mod, "probe_worker", lambda *a, **k: calls.append(1) or True
+        )
+
+        scheduler_mod.worker_alive(force=True)
+        scheduler_mod.worker_alive(force=True)
+
+        assert len(calls) == 2
+
+    def test_current_mode_reports_missing_worker(self, monkeypatch, settings):
+        """配了 Celery 但没 worker → 必须报 celery_no_worker，而不是绿色 celery。"""
+        from common import scheduler as scheduler_mod
+
+        settings.SCHEDULER_MODE = "celery"
+        monkeypatch.setattr(scheduler_mod, "resolve_mode", lambda: "celery")
+        monkeypatch.setattr(scheduler_mod, "probe_worker", lambda *a, **k: False)
+
+        assert scheduler_mod.current_mode() == "celery_no_worker"
+
+    def test_current_mode_reports_celery_when_worker_alive(self, monkeypatch, settings):
+        from common import scheduler as scheduler_mod
+
+        settings.SCHEDULER_MODE = "celery"
+        monkeypatch.setattr(scheduler_mod, "resolve_mode", lambda: "celery")
+        monkeypatch.setattr(scheduler_mod, "probe_worker", lambda *a, **k: True)
+
+        assert scheduler_mod.current_mode() == "celery"
+
+    def test_current_mode_inprocess_does_not_probe_worker(self, monkeypatch, settings):
+        """进程内调度已经在跑时无需探 worker，也避免多余的超时等待。"""
+        from common import scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod, "resolve_mode", lambda: "inprocess")
+
+        class Running:
+            @staticmethod
+            def is_running():
+                return True
+
+        monkeypatch.setattr(scheduler_mod, "_scheduler", Running())
+
+        called = []
+        monkeypatch.setattr(
+            scheduler_mod, "probe_worker", lambda *a, **k: called.append(1) or True
+        )
+
+        assert scheduler_mod.current_mode() == "inprocess"
+        assert called == []
