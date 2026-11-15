@@ -1,8 +1,13 @@
 # 数据库实例管理系统
 
-企业内部数据库实例的资产台账平台：登记部门 / 集群 / 实例，主动探测端口连通性，
-每 12 小时自动轮换密码并以密文落库，每天 00:00 按「部门 × 集群」统计实例数量，
-并用中间件记录每个请求的耗时。
+企业内部数据库实例的资产台账与运维平台：
+
+- **资产台账**：部门 → 集群（含架构与拓扑）→ 实例（含角色与复制上游）
+- **连通性**：TCP 端口探测，失败按瞬时/确定性分类，瞬时失败带退避重试
+- **密码轮换**：按策略定时执行，**真的连到目标库执行改密命令并回连验证**，再以密文落库
+- **统计**：每天 00:00 按「部门 × 集群」快照实例数量
+- **监控**：指标采集、SQL 洞察、锁等待与死锁、阈值告警、巡检评分、诊断报告
+- **审计**：语句执行审计、密码轮换历史、慢请求记录
 
 **交付形态：双击 `start.bat` 即可运行，全程无需输入命令。**
 
@@ -16,53 +21,69 @@
    （下载地址 <https://www.python.org/downloads/>，安装时**务必勾选** `Add Python to PATH`）。
 2. **双击 `start.bat`**。
 
-首次启动会自动完成下面这些事，你只需要等（约 1～2 分钟）：
+首次启动会自动完成下面这些事（约 1～2 分钟），共 7 步：
 
 | 步骤 | 说明 |
 |---|---|
-| 检查 Python | 版本不够会在窗口里给出提示并停住 |
-| 创建虚拟环境 | 在项目目录下生成 `.venv`，不影响系统 Python |
-| 安装依赖 | 自动使用国内镜像，失败会回退官方源 |
-| 生成配置 | 自动创建 `.env` 并填好加密密钥，无需手工配置 |
-| 建表 | 初始化 SQLite 数据库 `db.sqlite3` |
-| 启动服务 | 自动挑一个空闲端口，并帮你打开浏览器 |
+| 检查 Python 版本 | 版本不够会在窗口里给出提示并停住 |
+| 准备虚拟环境 | 在项目目录下生成 `.venv`，不影响系统 Python |
+| 检查依赖 | 缺失才安装，自动使用国内镜像，失败会回退官方源 |
+| 准备配置文件 | 自动创建 `.env` 并填好两个密钥，无需手工配置 |
+| 初始化数据库 | `migrate`，建表并同步角色组权限；随后幂等执行 `ensure_admin` |
+| 收集静态文件 | `collectstatic`（生产模式下 runserver 不再服务 `/static/`） |
+| 启动服务 | 自动挑空闲端口、拉起 Celery worker 与 beat（可用时）、打开浏览器 |
 
 第二次及以后启动会跳过已完成的步骤，通常几秒就能用。
 
+启动器支持的参数（一般用不到）：
+
+```bash
+python launcher.py                # 正常启动
+python launcher.py --port 9000    # 指定端口（被占用仍会自动顺延）
+python launcher.py --no-browser   # 不自动打开浏览器
+python launcher.py --check        # 只做环境自检，不启动服务（无副作用，不建 .venv）
+```
+
 ### 2. 常用地址
 
-启动窗口里会打印实际端口（默认 `8000`，被占用时自动顺延）：
+启动窗口里会打印实际端口（默认 `8000`，被占用时自动顺延，最多试 20 个）：
 
 | 页面 | 地址 |
 |---|---|
-| 管理界面 | `http://127.0.0.1:8000/` |
+| 总览 | `http://127.0.0.1:8000/` |
 | 操作控制台 | `http://127.0.0.1:8000/console/` |
+| 监控大盘 | `http://127.0.0.1:8000/monitor/` |
+| 锁分析 | `http://127.0.0.1:8000/monitor/locks/` |
+| SQL 洞察 | `http://127.0.0.1:8000/monitor/sql/` |
+| 告警事件 | `http://127.0.0.1:8000/monitor/alerts/` |
+| 巡检评分 | `http://127.0.0.1:8000/monitor/inspect/` |
 | 接口文档 | `http://127.0.0.1:8000/api/v1/docs` |
 | Django 后台 | `http://127.0.0.1:8000/admin/` |
 | 健康检查 | `http://127.0.0.1:8000/healthz` |
 
 ### 2.1 管理员账号
 
-首次启动会自动创建后台管理员，账号密码固定如下：
+首次启动会自动创建管理员，账号密码固定如下：
 
 | 用户名 | 密码 |
 |---|---|
 | `admin` | `Admin@123456` |
 
 > **首次登录会被强制改密。** 这个初始密码写在代码和 README 里，等于公开信息，
-> 所以系统把它当成「临时口令」处理：用 `admin` / `Admin@123456` 登录后，
-> 除改密页与接口文档之外的**所有页面**都会自动跳到 `/account/password/`，
-> 改完才能继续用。
+> 系统把它当「临时口令」处理：登录后除改密页、接口文档与静态资源之外的**页面**
+> 都会跳到 `/account/password/`，改完才能继续用。
+> （实现见 `common/force_password_change.py` 的 `EXEMPT_PREFIXES`：
+> `/static/`、`/media/`、`/healthz`、`/api/`、`/account/password/`、
+> `/admin/login/`、`/admin/logout/`、`/admin/password_change/` 放行。）
 >
-> 这个判断不靠一个开关标记，而是比对「建号时的密码哈希」。因此不管你用哪种方式
-> 改的密码——界面的改密页、后台右上角的「修改密码」、还是
-> `manage.py changepassword`——只要密码变了，限制就自动解除，不会出现
-> 「改了密码还被反复拦住」的情况。
+> 判断依据不是布尔开关，而是比对「建号时的密码哈希」
+> （`apps/web/models.py` 的 `DefaultPasswordWatch`）。所以不管用哪种方式改密
+> ——界面改密页、后台右上角「修改密码」、`manage.py changepassword`——
+> 只要密码变了限制就自动解除，不会出现「改了还被反复拦住」。
 >
-> 接口（`/api/v1/`）不受此限制：调用方是脚本，没有界面可以改密，
-> 拦住只会让既有自动化突然失败。
+> 接口（`/api/v1/`）不受此限制：调用方是脚本，没有界面可以改密。
 
-也可以用环境变量指定自己的账号，不写进代码：
+也可以不写进代码，用环境变量指定：
 
 ```
 set ADMIN_USERNAME=ops
@@ -70,58 +91,87 @@ set ADMIN_PASSWORD=你的强密码
 python manage.py ensure_admin
 ```
 
-用这种方式指定了**非默认**密码时，不会被要求强制改密——那已经不是公开信息了。
+指定了**非默认**密码时不会被要求改密；想恢复默认值用 `--reset-password`
+（重置后下次登录会**重新**要求改密）。
 
-确实想恢复默认密码（例如忘记了自设的密码），用显式重置：
+### 2.2 谁能做什么（鉴权 + 权限分档）
 
-```bash
-python manage.py ensure_admin --reset-password
-```
+「能不能看」与「能不能改」是两件事，且写操作内部还按**后果的不可逆程度**分了三级
+（`common/permissions.py`，权限点挂在 `Instance` 上，角色即 Django Group）：
 
-重置回默认值后，下次登录会**重新**要求改密。
+| 角色（Django Group） | 拥有的权限点 | 能做 |
+|---|---|---|
+| 只读 | —（空权限集） | 总览、各列表与详情、统计、慢请求、监控页、巡检评分 |
+| 操作员 | `assets.operate_assets` | 增删改部门 / 集群 / 实例、单实例探测、单实例轮换、验证凭据、管理告警规则 |
+| 管理员 | 上面 + `assets.admin_console`、`assets.admin_bulk_rotate`、`assets.admin_rebuild_stats`、`assets.admin_delete_cascade` | 在控制台执行任意 SQL、批量轮换与修改轮换策略、重算统计、删集群 / 部门 |
 
-### 2.2 谁能做什么（鉴权口径）
+要点：
 
-本系统按「看得见」和「改得动」两档区分：
-
-| 操作 | 是否需要登录 |
-|---|---|
-| 浏览总览、部门 / 集群 / 实例列表与详情、数量统计、慢请求 | **不需要**，内网随手可看 |
-| 打开操作控制台、查看实例列表、验证凭据 | **不需要** |
-| 在控制台里执行 SQL、通过 `/api/v1/instances/{id}/execute` 执行 SQL | **需要** |
-| 新建 / 修改 / 删除部门、集群、实例 | **需要** |
-| 立即探测、立即轮换密码 | **需要** |
-| 重算某天统计 | **需要** |
-| 通过 `/api/v1` 的 POST / PATCH / DELETE 改数据 | **需要**（复用 Django 会话，浏览器已登录即可） |
-
-未登录点写操作时不会看到报错页，而是被引导到登录页，登录成功后**自动回到你刚才所在的页面**，再点一次按钮即可。
-
-> API 复用 Django 会话登录，因此跨站伪造请求会被 CSRF 校验拦住。
-> 用脚本调写接口时，需先登录取得 `sessionid` 与 `csrftoken` 两个 Cookie。
-
-`/admin/` 只在需要直接看数据库原始记录时用。
+- **浏览免登录**（内网随手看），**写操作必须登录**，未登录点写按钮会被引导到登录页，
+  登录后**自动回到原页面**。
+- 已登录但缺权限时给的是「请联系管理员分配角色」的提示并回首页，不是裸 403。
+- `superuser`（初始 `admin` 即 superuser）对所有权限点恒为 True，升级不会把管理员锁在门外。
+- 超出「只读」的写操作若被拦，页面提示与 API 的 403 错误体里都会说明缺哪个权限点
+  （`detail.required_permission`）。
+- API 的写接口复用 Django 会话（`django_session_auth`，含 CSRF 校验）。脚本调写接口需先登录取得
+  `sessionid` 与 `csrftoken` 两个 Cookie；`/api/v1/monitor/*` 整组路由都要求登录。
+- 想调整某人权限：`/admin/` → 用户 / 组，把账号放进「只读」「操作员」「管理员」三个组之一。
 
 ### 3. 日常操作
 
 | 我想…… | 怎么做 |
 |---|---|
-| 登记一个部门 | 左侧「部门」→ 右上角「新增部门」 |
-| 登记一个集群 | 「集群」→「新增集群」，选择所属部门、数据库类型、环境 |
-| 登记一个数据库实例 | 「实例」→「新增实例」，填主机、端口、登录账号 |
-| 看某个实例能不能连上 | 进实例详情页 → 点「立即探测」 |
-| 立刻更换某个实例的密码 | 进实例详情页 → 点「立即轮换」 |
-| 看密码换过几次 | 实例详情页下方的「轮换历史」 |
+| 登记一个部门 | 左侧「部门」→「新增部门」 |
+| 登记一个集群 | 「集群」→「新增集群」，选部门、引擎、环境、**架构** |
+| 登记一个实例 | 「实例」→「新增实例」，填主机、端口、账号；按架构选**角色**，从库填复制上游 |
+| 编排复制关系 | 集群详情 →「复制关系」；架构确定后可用「按架构自动生成」 |
+| 看集群拓扑图 | 集群详情（数据来自 `/clusters/<id>/topology.json`） |
+| 看某个实例能不能连上 | 实例详情 →「立即探测」（只验端口） |
+| 确认登记的账号密码可用 | 打开实例详情即自动验证一次；或控制台 `verify` |
+| 立刻更换某个实例的密码 | 实例详情 →「立即轮换」 |
+| 看密码换过几次 | 实例详情下方的「轮换历史」 |
+| 改轮换周期 / 范围 / 密码长度 | 左侧「轮换策略」→ 保存（保存与「立即执行」都需要管理员权限） |
 | 看昨天各部门有多少实例 | 「数量统计」→ 选日期 → 查询 |
 | 找出慢的请求 | 「慢请求」 |
-| 直接对某个库执行 SQL | 左侧「控制台」→ `list` 看实例 → `use <id>` → 输入 SQL 回车 |
-| 看某台实例当前什么状况 | 「实例」→ 详情页 → 「监控」→ 实时性能 |
-| 看某台实例最近几小时的曲线 | 实例详情 → 「监控」→ 性能趋势（可切 1 小时 ~ 30 天） |
-| 看谁在等锁、有没有死锁 | 实例监控页 → 「锁分析」 |
-| 找出最耗时的 SQL | 实例监控页 → 「SQL 洞察」，可切总耗时 / 单次平均 / 执行次数 |
+| 直接对某个库执行 SQL | 左侧「控制台」→ `list` → `sw <目标>` → 输入 SQL |
+| 看某台实例当前什么状况 | 实例详情 →「监控」→ 实时性能 |
+| 看某台实例最近几小时的曲线 | 实例详情 →「监控」→ 性能趋势（1 小时 ~ 30 天） |
+| 看某台实例的空间与连接 | 实例监控页 →「空间」「会话」 |
+| 看谁在等锁、有没有死锁 | 「锁分析」（全库视角）或实例监控页 |
+| 找出最耗时的 SQL | 「SQL 洞察」，可切总耗时 / 单次平均 / 执行次数 |
 | 一眼看全站有没有事 | 左侧「监控大盘」：只列有问题的实例 |
 | 配一条「连接数超 80% 就通知我」 | 「告警」→「告警规则」→ 新增规则 |
 | 今天该先修哪台机器 | 左侧「巡检评分」：按分数升序，最该修的排最前 |
-| 要对某个库做整体体检 | 集群详情 → 「监控」→ 集群概览 → 诊断报告 |
+| 要对某个库做整体体检 | 集群详情 →「监控」→ 集群概览 → 诊断报告 |
+
+### 3.1 控制台怎么用
+
+「控制台」是一个黑底等宽的终端页面，适合习惯命令行的运维。打开后先输入 `help`：
+
+| 命令 | 作用 |
+|---|---|
+| `help` / `?` | 显示帮助 |
+| `list` / `ls` `[页码]` | 分页列出实例，带 id、别名、引擎、环境、地址、密码是否已设置 |
+| `sw <目标>` | 切换当前实例。目标可写 `id`、`集群别名.实例别名`、`集群别名@主机` |
+| `status` | 看当前实例的信息 |
+| `verify` | 真正连一次目标库，确认登记的账号密码能用 |
+| `clear` / `cls` | 清屏（也可以按 `Ctrl+L`） |
+| `exit` / `quit` | 提示关标签页退出 |
+| 其它输入 | 当作 SQL 发给当前实例执行 |
+
+几个要点：
+
+- **执行 SQL 需要登录，且需要 `admin_console` 权限**（等于把目标库凭据借出去用）。
+  没登录时控制台会明确提示去登录，而不是报一个看不懂的错。
+- 查询结果以等宽表格显示，并标出返回行数、是否被截断、耗时。
+- 结果默认最多返回 500 行（`DB_MAX_ROWS` 可调），避免一条 `SELECT *` 把内存打满。
+- **`DROP` / `TRUNCATE` 会要求二次确认**：第一次输入只给警告，把同一条语句再输一次才真的执行。
+  走 API 时对应的是 `confirm=true`，否则返回 409（`code=CONFIRM_REQUIRED`）。
+- 一次只允许一条语句（上限 10000 字符），`SELECT 1; DROP TABLE t` 会在建连前被直接拒绝。
+- 每一条执行（含被拒绝的）都会写进 `StatementAuditLog`，记录操作人、语句前 500 字符与耗时。
+
+> 反过来，**实例详情页**的「凭据验证」卡片和「立即探测」按钮是给不想碰命令行的人用的：
+> 打开详情页即自动验证一次账号密码（只读，不落库），点「立即探测」则只验证端口通不通。
 
 ### 3.2 监控与告警怎么用
 
@@ -131,11 +181,14 @@ python manage.py ensure_admin --reset-password
 |---|---|
 | MySQL | 可读 `information_schema`、`performance_schema` |
 | PostgreSQL | 可读 `pg_stat_activity`、`pg_database_size`；SQL 洞察需 `pg_stat_statements` 扩展 |
-| Redis | 账号可执行 `INFO`；SQL 洞察走 `INFO commandstats` |
+| Redis | 账号可执行 `INFO`；SQL 洞察走 `INFO commandstats`；慢日志需配 `slowlog-log-slower-than` |
+
+> 采集器目前只实现了这三种引擎（`apps/monitor/collectors/`）。MongoDB 实例可以登记、
+> 可以探活、也可以轮换密码，但**没有指标采集**，监控页会显示无数据。
 
 三件容易踩的事：
 
-1. **采集周期最短 1 分钟**。写 0 会让任务永不触发（调度器按分钟去重）。
+1. **采集周期最短 1 分钟**。写 0 会让任务永不触发（进程内调度器按分钟去重，crontab 也非法）。
 2. **页面显示「尚无采集记录」不是故障**，多半是刚加实例，等一轮即可。
    若长期如此，看「监控大盘」的「需要关注的实例」，那里直接给出错误码。
 3. **告警不会因为「连不上」而响**。连不上目标库时没有指标可评，
@@ -149,34 +202,10 @@ MONITOR_ALERT_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x
 
 只推「新触发」与「恢复」两类事件，不重复推送——否则持续越界的指标会每分钟推一条。
 
-### 3.1 控制台怎么用
-
-「控制台」是一个黑底等宽的终端页面，适合习惯命令行的运维。打开后先输入 `help`：
-
-| 命令 | 作用 |
-|---|---|
-| `list` | 列出全部实例，带 id、地址、账号、密码是否已设置 |
-| `use 3` | 选中 id=3 的实例，之后所有 SQL 都发到它上面 |
-| `status` | 看当前选中实例的信息 |
-| `verify` | 真正连一次目标库，确认登记的账号密码能用 |
-| `clear` | 清屏（也可以按 `Ctrl+L`） |
-| 其它输入 | 当作 SQL 发给当前实例执行 |
-
-几个要点：
-
-- **执行 SQL 需要登录**。没登录时控制台会明确提示去登录，而不是报一个看不懂的错。
-- 查询结果以等宽表格显示，并标出返回行数、是否被截断、耗时。
-- 结果默认最多返回 500 行（`DB_MAX_ROWS` 可调），避免一条 `SELECT *` 把内存打满。
-- **`DROP` / `TRUNCATE` 会要求二次确认**：第一次输入只给警告，把同一条语句再输一次才会真的执行。
-- 一次只允许一条语句，`SELECT 1; DROP TABLE t` 会被直接拒绝。
-- 每一条执行（含被拒绝的）都会写进审计表，记录操作人、语句前 500 字符与耗时。
-
-> 反过来，**实例详情页**的「凭据验证」卡片和「立即探测」按钮是给不想碰命令行的人用的：
-> 打开详情页即自动验证一次账号密码，点「立即探测」则只验证端口通不通。
-
 ### 4. 关闭
 
-在启动窗口按 `Ctrl+C`，或直接关掉那个黑窗口即可。数据都在 `db.sqlite3` 里，下次启动还在。
+在启动窗口按 `Ctrl+C`，或直接关掉那个黑窗口即可。启动器会把 Celery worker 与 beat
+一并终止。数据都在 `db.sqlite3` 里，下次启动还在。
 
 ### 5. 出问题了怎么办
 
@@ -184,93 +213,118 @@ MONITOR_ALERT_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x
 |---|---|
 | 窗口一闪就没了 | 说明没找到 Python，按上面第 1 步装好并勾选 `Add Python to PATH` |
 | 提示依赖安装失败 | 检查网络；公司网络需要代理时先设置 `HTTP_PROXY` 环境变量 |
-| 端口被占用 | 启动器会自动换端口，窗口里会打印实际地址 |
+| 端口被占用 | 启动器会自动换端口（最多试 20 个），窗口里会打印实际地址 |
 | 想确认环境是否正常 | 在项目目录运行 `python launcher.py --check` |
-| 页面提示"轮换失败" | 实例被停用（停用实例不参与轮换），或另一处正在轮换同一实例 |
+| 页面提示「轮换失败」 | 实例被停用（停用实例不参与轮换），或另一处正在轮换同一实例；失败原因看轮换历史里的 `error_message` |
+| 定时任务没动静 | 看总览页「运行状态」卡片的调度模式；`SCHEDULER_MODE=celery` 而 worker 未起时页面会红字提示 |
 
 ### 6. 备份与恢复
 
 只需要备份两个文件：
 
 - `db.sqlite3` —— 全部业务数据
-- `.env` —— 包含加密密钥
+- `.env` —— 包含 `DJANGO_SECRET_KEY` 与 `FIELD_ENCRYPTION_KEY`
 
 > **重要**：`.env` 里的 `FIELD_ENCRYPTION_KEY` 一旦丢失，已加密的密码将**永久无法解密**。
 > 请把它和数据库分开、离线备份。`.env` 不要提交到代码仓库（已在 `.gitignore` 中排除）。
 
 ---
 
-## 二、给开发者：项目结构与实现状态
+## 二、给开发者：项目结构与实现
 
 ### 2.1 目录结构
 
 ```
 db_manager/
-├── start.bat                 # Windows 双击入口
-├── launcher.py               # 一键启动器（仅标准库，可在无依赖环境运行）
+├── start.bat                 # Windows 双击入口（纯 ASCII + CRLF，中文提示交给 launcher.py）
+├── launcher.py               # 一键启动器（仅标准库；--port / --no-browser / --check）
 ├── requirements.txt
 ├── .env.example              # 配置模板；.env 由启动器自动生成
+├── pytest.ini
 ├── config/
-│   ├── settings.py           # 配置分层，加密密钥缺失即拒绝启动
-│   ├── celery.py             # Celery 应用
-│   ├── urls.py               # 页面 / API / admin 挂载
+│   ├── settings.py           # 配置分层；密钥缺失即拒绝启动
+│   ├── celery.py             # Celery 应用（namespace="CELERY" + autodiscover）
+│   ├── urls.py               # 页面 / API / admin / healthz 挂载
 │   └── wsgi.py / asgi.py
 ├── common/
-│   ├── env.py                # 极简 .env 解析（不引入额外依赖）
+│   ├── env.py                # 极简 .env 解析 + secret_key_problem（与启动器共用同一套判定）
 │   ├── api.py                # NinjaAPI 实例 + 统一异常处理 + 路由汇总
-│   ├── exceptions.py         # BusinessError / NotFoundError / ConflictError
-│   ├── pagination.py         # {count, page, page_size, results}
+│   ├── auth.py               # django_session_auth（会话 + CSRF）
+│   ├── auth_backends.py      # 登录后端
+│   ├── auth_signals.py       # 登录成功/失败记账（喂给限流）
+│   ├── permissions.py        # 三级权限点与角色（= Django Group）
+│   ├── force_password_change.py  # 默认口令强制改密中间件
+│   ├── middleware.py         # request_id + 慢请求计时
+│   ├── throttle.py           # 登录失败限流
 │   ├── scheduler.py          # 三模式调度：auto / celery / inprocess
-│   ├── middleware.py         # 请求耗时中间件 ✅
+│   ├── exceptions.py         # BusinessError / NotFoundError / ConflictError / PermissionDeniedError …
+│   ├── pagination.py         # {count, page, page_size, results}
+│   ├── search.py             # SEARCH_MODE=contains|prefix
+│   ├── sqlite_writes.py      # SQLite 写锁重试
+│   ├── timing.py             # Stopwatch（中间件与任务共用）
 │   └── health.py             # /healthz
 ├── apps/
-│   ├── runtime/              # 调度器生命周期（置于业务 app 之前）
+│   ├── runtime/              # 进程内调度器生命周期（须排在业务 app 之前）
 │   ├── assets/               # 部门 / 集群 / 实例 / 轮换历史
-│   │   ├── models.py         ✅
-│   │   ├── schemas.py        ✅
-│   │   ├── api.py            ✅ 15 个 CRUD 端点
-│   │   └── admin.py          ✅
-│   ├── probing/              # TCP 探测
-│   │   ├── api.py            ✅
-│   │   └── services.py       ✅ probe_tcp
-│   ├── credentials/          # 加密与轮换
-│   │   ├── crypto.py         ✅ 加解密 / 密码生成 / 指纹
-│   │   ├── services.py       ✅ rotate_one / rotate_all
-│   │   ├── tasks.py          ✅ Celery 包装层
-│   │   └── api.py            ✅
+│   │   ├── models.py         # Department / Cluster / Instance / PasswordRotationLog
+│   │   ├── schemas.py        # In / Patch / Out / Paged 四类 Schema
+│   │   ├── api.py            # departments / clusters / instances 三个 Router
+│   │   ├── validators.py     # 别名规则
+│   │   ├── replication.py    # 按架构自动生成复制关系
+│   │   ├── topology.py       # build_topology（拓扑图数据）
+│   │   ├── resolver.py       # 「集群.实例」「集群@主机」解析（控制台用）
+│   │   ├── roles.py          # 角色与架构的对应关系
+│   │   ├── admin.py
+│   │   └── management/commands/ensure_admin.py
+│   ├── probing/              # TCP 探测（services.probe_tcp + 1 个 API）
+│   ├── credentials/          # 加密 / 改密 / 轮换策略
+│   │   ├── crypto.py         # 加解密 / 密码生成 / 指纹
+│   │   ├── changers.py       # mysql / postgresql / redis / mongodb 改密与回连验证
+│   │   ├── services.py       # rotate_one / rotate_all
+│   │   ├── models.py         # RotationPolicy（全局单例）
+│   │   ├── schedule.py       # 到点判定（interval / daily）
+│   │   ├── tasks.py          # Celery：按策略轮换、全量轮换
+│   │   └── api.py            # 立即轮换 + 轮换历史
+│   ├── dbconsole/            # 控制台执行
+│   │   ├── services.py       # 连接、语句分类、破坏性判定、执行、审计
+│   │   ├── models.py         # StatementAuditLog
+│   │   └── api.py            # verify-credentials + execute
 │   ├── metrics/              # 统计与观测
-│   │   ├── models.py         ✅
-│   │   ├── services.py       ✅ aggregate_for_date
-│   │   ├── tasks.py          ✅ Celery 包装层
-│   │   ├── api.py            ✅
-│   │   └── management/commands/aggregate_instance_stats.py  ✅
+│   │   ├── models.py         # DailyInstanceStat / SlowRequestLog
+│   │   ├── services.py       # aggregate_for_date
+│   │   ├── slowlog.py        # 异步批量落库
+│   │   ├── retention.py      # 日志保留期清理
+│   │   ├── tasks.py          # Celery 包装
+│   │   ├── api.py
+│   │   └── management/commands/{aggregate_instance_stats,cleanup_expired_logs}.py
 │   ├── monitor/              # 监控：采集 / 告警 / SQL 洞察 / 锁 / 巡检
-│   │   ├── models.py         ✅ MetricSample / CollectionRun / AlertRule /
-│   │   │                        AlertEvent / SqlDigest / LockWait / DeadlockEvent
-│   │   ├── collectors/       ✅ base + mysql / postgresql / redis_collector
-│   │   ├── services.py       ✅ 采集编排、速率换算、保留期清理
-│   │   ├── tasks.py          ✅ 采集 / 清理 / 告警评估 / 锁采集
-│   │   ├── queries.py        ✅ 时序查询与降采样
-│   │   ├── sqltext.py        ✅ SQL 归一化 + sha1 指纹
-│   │   ├── sql_collector.py  ✅ 三引擎语句统计采集
-│   │   ├── lock_collector.py ✅ 锁等待与死锁采集
-│   │   ├── alerting.py       ✅ 阈值评估（持续时长 / 冷却 / 自动收敛）
-│   │   ├── notify.py         ✅ webhook 通知
-│   │   ├── inspect.py        ✅ 巡检评分（纯函数）
-│   │   ├── reports.py        ✅ 诊断报告取数
-│   │   ├── catalog.py        ✅ 指标目录
-│   │   └── api.py            ✅ 时序 / 最新值 / 采集状态
+│   │   ├── models.py         # MetricSample / CollectionRun / AlertRule / AlertEvent /
+│   │   │                        SqlDigest / LockWait / DeadlockEvent
+│   │   ├── collectors/       # base + mysql / postgresql / redis_collector
+│   │   ├── services.py       # 采集编排、速率换算、保留期清理
+│   │   ├── tasks.py          # 采集 / 清理 / 告警评估 / 锁采集
+│   │   ├── queries.py        # 时序查询与降采样
+│   │   ├── sqltext.py        # SQL 归一化 + sha1 指纹
+│   │   ├── sql_collector.py  # 三引擎语句统计采集
+│   │   ├── lock_collector.py # 锁等待与死锁采集
+│   │   ├── alerting.py       # 阈值评估（持续时长 / 冷却 / 自动收敛）
+│   │   ├── notify.py         # webhook 通知
+│   │   ├── inspect.py        # 巡检评分（纯函数）
+│   │   ├── reports.py        # 诊断报告取数
+│   │   ├── catalog.py        # 指标目录
+│   │   └── api.py            # 时序 / 最新值 / 采集状态 / 引擎目录
 │   └── web/                  # 服务端渲染界面
-│       ├── forms.py          ✅ 4 个 ModelForm
-│       ├── views.py          ✅ 资产管理视图
-│       ├── monitor_views.py  ✅ 集群监控 / 大盘 / 画像 / SQL / 锁 / 巡检
-│       ├── monitor_instance_views.py  ✅ 实例级五个监控页
-│       ├── monitor_alert_views.py     ✅ 事件中心与规则管理
-│       └── urls.py           ✅
-├── common/timing.py          ✅ 计时组件（中间件与任务共用）
-├── templates/                # base + 各类页面模板
+│       ├── models.py         # DefaultPasswordWatch
+│       ├── forms.py          # ModelForm 集合（含轮换策略）
+│       ├── decorators.py     # login_required_page
+│       ├── views.py          # 资产 / 统计 / 控制台 / 改密
+│       ├── monitor_views.py  # 集群监控 / 大盘 / 画像 / SQL / 锁 / 巡检 / 报告
+│       ├── monitor_instance_views.py  # 实例级五个监控页
+│       ├── monitor_alert_views.py     # 事件中心与规则管理
+│       └── urls.py
+├── templates/                # base + 2 个局部模板 + 32 个页面模板
 ├── static/css/app.css        # 全站样式（纯本地，无 CDN）
-└── tests/                    ✅ 全部通过
+└── tests/                    # pytest，45 个测试文件
 ```
 
 ### 2.2 核心算法实现说明
@@ -295,16 +349,28 @@ db_manager/
 `socket.create_connection` + `perf_counter` 计时，异常映射为
 `timeout` / `refused` / `dns_failed` / `network_unreachable` / `unknown`。
 **任何分支都不向外抛异常**——探测不到是业务结论，不是服务端错误。
+瞬时类失败按 `PROBE_MAX_ATTEMPTS` / `PROBE_BACKOFF_BASE_MS` / `PROBE_TOTAL_BUDGET_MS`
+退避重试，确定性失败（如 DNS 解析不到）不重试。
 errno 常量用 `hasattr` 过滤，避免在部分平台上 import 即失败。
 
-#### ③ 密码轮换 —— `apps/credentials/services.py`
+#### ③ 密码轮换 —— `apps/credentials/{services,changers,schedule}.py`
 
-- `rotate_one`：事务 + `select_for_update` → 旧密码指纹 → 新密码加密落库 →
-  `password_version += 1` → 写 `PasswordRotationLog`。
-  并发用**乐观锁**兜底（更新条件带旧 `password_version`），因为 SQLite 会
-  静默忽略 `select_for_update`。失败历史在事务外写，避免随回滚一起丢失。
-- `rotate_all`：按 id 游标分批（默认 100），单条失败不中断整批。
+- **真的会连目标库改密**。`changers.py` 按引擎提供「改密 + 回连验证」一对函数：
+  MySQL（`ALTER USER`）、PostgreSQL（`ALTER ROLE`）、Redis（`ACL SETUSER`）、
+  MongoDB（`updateUser`）。改完立即用新密码回连一次，只有回连成功才算成功
+  （`ROTATION_VERIFY_AFTER_CHANGE=True` 时生效，关掉可省一次连接，但会失去确认能力）。
+- `rotate_one`：事务 + 乐观锁（更新条件带旧 `password_version`，因为 SQLite 会
+  静默忽略 `select_for_update`）→ 旧密码指纹 → 改密 → 新密码加密落库 →
+  `password_version += 1` → 写 `PasswordRotationLog`。失败历史在事务外写，
+  避免随回滚一起丢失；`error` 字段记录 `auth_failed` / `change_failed` /
+  `verify_failed` 等具体原因。
+- `rotate_all`：按 id 游标分批（默认 100），单条失败不中断整批；
+  并发度按后端自适应（`ROTATION_CONCURRENCY=0` 表示 SQLite 收敛、PostgreSQL 放开）。
   不用 `.iterator()` 是因为边读边写同一张表在 SQLite 上容易表锁。
+- **调度**：`RotationPolicy` 是全局单例（`pk=1`），支持 `interval`（每 N 小时）
+  与 `daily`（每日定点，逗号分隔多个时刻）两种口径。beat / 进程内调度**每分钟**
+  戳一次，真正的「到点没有」由 `schedule.py` 读策略判断——因为「每 7 小时」
+  这种严格间隔 cron 表达不了（`*/7` 每天 0 点会重置）。
 
 #### ④ 每日统计 —— `apps/metrics/services.py`
 
@@ -320,13 +386,19 @@ errno 常量用 `hasattr` 过滤，避免在部分平台上 import 即失败。
 
 - **调度三模式**：`SCHEDULER_MODE=auto|celery|inprocess`。`auto` 会在启动时探测
   broker **并向 worker 发 ping**（只有 broker 通、worker 也回应才判定为 Celery，
-  否则 Redis 起着而 worker 没起时，定时任务会静默不执行）
-  broker（0.3 秒超时），连不上就自动降级为进程内线程调度，**与 Celery 共用同一批任务函数**
+  否则 Redis 起着而 worker 没起时，定时任务会静默不执行），
+  连不上就自动降级为进程内线程调度，**与 Celery 共用同一批任务函数**
+- **Celery 任务路由**：轮换走 `rotation` 队列，其余走 `default`；
+  `TASK_ACKS_LATE` + `REJECT_ON_WORKER_LOST`，worker 被杀不会丢任务
+- **beat 计划**：轮换每分钟、统计 00:00、日志清理 03:30、指标清理 04:10、
+  采集/告警/锁按各环境变量周期
 - **配置分层**：`DB_ENGINE=sqlite|postgresql` 切换，无需改代码
-- **密钥校验**：`FIELD_ENCRYPTION_KEY` 缺失或格式非法 → 启动即失败，不降级明文
-- **统一错误体**：`{"code", "message", "detail"}`，业务异常 throw 即转换
+- **密钥校验**：`DJANGO_SECRET_KEY` / `FIELD_ENCRYPTION_KEY` 缺失、占位符或格式非法
+  → 启动即失败，不降级明文
+- **统一错误体**：`{"code", "message", "detail"}`，业务异常 throw 即转换；
+  校验失败 422、缺权限 403（带 `detail.required_permission`）
 - **分页结构**：`{"count", "page", "page_size", "results"}`
-- **数据库约束**：集群名部门内唯一、实例端点集群内唯一、端口 1–65535（Schema 层校验）
+- **数据库约束**：集群名部门内唯一、实例端点集群内唯一、别名唯一、端口 1–65535
 - **request_id**：所有响应都带 `X-Request-ID`（含被耗时统计排除的路径）
 - **界面零外部依赖**：CSS 全本地，目标机器无外网也能正常显示
 
@@ -336,16 +408,22 @@ errno 常量用 `hasattr` 过滤，避免在部分平台上 import 即失败。
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
-cp .env.example .env            # 填入 FIELD_ENCRYPTION_KEY
+cp .env.example .env            # 填入 DJANGO_SECRET_KEY 与 FIELD_ENCRYPTION_KEY
 python manage.py migrate
+python manage.py ensure_admin
 python manage.py runserver
 ```
 
-生成加密密钥：
+生成两个密钥：
 
 ```bash
+python -c "import secrets; print(secrets.token_urlsafe(64))"
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
+
+`DEBUG` 默认是 **False**。此时 `runserver` 不再服务 `/static/`，静态文件由 whitenoise
+接管（`collectstatic` 后从 `staticfiles/` 提供）。本地要看调试页才在 `.env` 里写
+`DJANGO_DEBUG=True`。
 
 #### Celery 由启动器自动托管
 
@@ -368,6 +446,8 @@ celery -A config beat -l info --schedule celerybeat-schedule
 
 > Windows 上必须带 `-P threads`：celery 默认的 prefork 池在 Windows 不可用。
 > `beat` 全局只能有**一个**实例，多开会重复投递任务。
+> 注意 `apps/runtime/apps.py` 会识别 celery 进程（`is_celery_process`）并跳过
+> 进程内调度器，否则 worker 里会再起一个调度线程、同一批任务被执行两遍。
 
 ### 2.5 多进程部署（重要约束）
 
@@ -396,17 +476,10 @@ celery -A config beat -l info --schedule celerybeat-schedule
 
 2. **定时任务交给 Celery。** 设 `SCHEDULER_MODE=celery`（缺 Redis 会直接报错，
    而不是悄悄降级成进程内模式）。`launcher.py` 会自动托管 worker 与 beat；
-   若要把它们拆到独立机器，手工启动即可：
+   若要把它们拆到独立机器，手工启动即可（命令见 §2.4）。
 
-   ```bash
-   celery -A config worker -l info -Q default,rotation -P threads -c 4
-   celery -A config beat -l info --schedule celerybeat-schedule
-   ```
-
-   `beat` 全局只能有**一个**实例，多开会重复投递任务。
-
-   > 配了 `celery` 但 worker 没起来时，仪表盘会显示红色的「Celery 未就绪」
-   > 并明确说明定时任务不会执行——这类沉默停摆必须让人一眼看到。
+   > 配了 `celery` 但 worker 没起来时，总览页的「运行状态」卡片会显示红色的
+   > 「Celery 未就绪」并明确说明定时任务不会执行——这类沉默停摆必须让人一眼看到。
 
 3. **确认调度器没被意外拉起。** 多 worker 部署下可以用
    `DISABLE_SCHEDULER=1` 在 Web 进程里彻底关掉进程内调度器，把触发权完全交给
@@ -425,67 +498,7 @@ celery -A config beat -l info --schedule celerybeat-schedule
 ### 2.6 验证
 
 ```bash
-python manage.py check         # 装配检查
-python -m pytest tests/ -q     # 全部测试
-python launcher.py --check     # 启动器环境自检
+python manage.py check            # 装配检查
+python -m pytest tests/ -q        # 全部测试
+python launcher.py --check        # 启动器环境自检
 ```
-
----
-
-## 三、接口一览
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET/POST | `/api/v1/departments` | 部门列表 / 新建 |
-| GET/PATCH/DELETE | `/api/v1/departments/{id}` | 部门详情 / 更新 / 删除 |
-| GET/POST | `/api/v1/clusters` | 集群列表 / 新建 |
-| GET/PATCH/DELETE | `/api/v1/clusters/{id}` | 集群详情 / 更新 / 删除 |
-| GET/POST | `/api/v1/instances` | 实例列表 / 新建 |
-| GET/PATCH/DELETE | `/api/v1/instances/{id}` | 实例详情 / 更新 / 删除 |
-| POST | `/api/v1/instances/{id}/probe` | TCP 端口探测 |
-| POST | `/api/v1/instances/{id}/rotate-password` | 手动轮换密码 |
-| GET | `/api/v1/instances/{id}/rotations` | 轮换历史 |
-| GET | `/api/v1/stats/daily` | 按日期查询统计快照 |
-| POST | `/api/v1/stats/daily/rebuild` | 重算某日统计（幂等） |
-| GET | `/api/v1/monitor/series` | 指标时序（自动按跨度降采样） |
-| GET | `/api/v1/monitor/latest` | 指标最新值 |
-| GET | `/api/v1/monitor/collect-status` | 最近一次采集状态 |
-| GET | `/api/v1/monitor/engines` | 指标目录 |
-
-实例相关的**任何响应都不包含密码或密文**，只暴露 `password_set` 与 `password_version`。
-
-完整契约见 PRD 第 7 节，或启动后访问 `/api/v1/docs` 在线调试。
-
----
-
-## 四、设计取舍
-
-**为什么用 django-ninja 而不是 DRF**：写法贴近 FastAPI（装饰器 + Pydantic Schema），
-省掉 Serializer 样板，内置 OpenAPI。代价是过滤 / 权限要自己写——本项目规模下可接受。
-若评审方要求 DRF，模型层可完全复用，只需重写路由与 Schema 层。
-
-**为什么「轮换」不连目标库改密**：真实改密需要多数据库方言适配与失败回滚。
-本期只做应用侧：生成强随机密码 → 加密落库 → 版本号递增 → 写审计历史。
-生产演进方向见 PRD §9.4.3（`PasswordChanger` 策略类 + 双密码过渡窗口）。
-
-**为什么调度要自动降级**：目标机器是运维的办公电脑，不一定装 Redis。
-`auto` 模式下有 Redis 就走 Celery，没有就退化为进程内线程调度，两者调用**同一批任务函数**，
-行为一致，运维无需理解差异。
-
-**为什么统计表冗余名称字段**：集群改名或删除后，历史快照若走外键会失真。
-存快照值 + 外键 `SET_NULL` 是趋势类数据的标准做法。
-
-**为什么界面用服务端渲染而非 SPA**：交付对象是不熟悉命令行的运维人员，
-SSR 没有构建步骤、没有前端依赖、断网也能用，双击即开。
-
-**为什么启动器只用标准库**：它要能在**还没装任何依赖**的机器上跑起来，
-所以 .env 生成、密钥生成（`os.urandom` + base64）都自己实现，不 import cryptography。
-
-**为什么 `start.bat` 必须保持纯 ASCII + CRLF**：cmd.exe 在 `chcp 65001` 生效**之前**
-就已经按系统代码页（GBK）解析整个批处理文件。文件里只要有中文，就会被读成乱码，
-而且乱码行会被当作命令执行，窗口里会刷出一堆
-`'舵壘涓嶅埌椤圭洰鏂囦欢' 不是内部或外部命令`。
-因此：批处理只做流程控制与英文提示，所有中文提示交给 `launcher.py` 输出
-（它会把 stdout 强制设为 UTF-8）。另外批处理必须是 CRLF 行尾，
-LF-only 会让 `goto :label` 定位失败。
-修改 `start.bat` 后请确认这两点。
